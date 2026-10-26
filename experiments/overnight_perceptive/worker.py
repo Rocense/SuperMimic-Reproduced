@@ -25,6 +25,14 @@ def write_json(path, value):
     temporary.replace(path)
 
 
+def extend_resume_budget(schedule, completed_iteration):
+    """Allow another segment without moving the original LR decay endpoint."""
+    decay_steps = schedule.total_iterations * schedule.lr_decay_fraction
+    while schedule.total_iterations < completed_iteration + 50000:
+        schedule.total_iterations *= 2
+    schedule.lr_decay_fraction = decay_steps / schedule.total_iterations
+
+
 class CheckedTrainer(Trainer):
     """Atomic snapshots, bounded retention, and cooperative stopping for this run."""
     def __init__(self, cfg, deadline):
@@ -97,6 +105,9 @@ def train(job):
     if job.get('resume'):
         cfg.resume = Path(job['resume'])
         cfg.init_policy = cfg.init_world_model = None
+        metadata = torch.load(cfg.resume, map_location='cpu', weights_only=False)
+        extend_resume_budget(cfg.schedule, int(metadata['iteration']))
+        del metadata
     trainer = CheckedTrainer(cfg, job['deadline'])
     try:
         if cfg.resume is None:

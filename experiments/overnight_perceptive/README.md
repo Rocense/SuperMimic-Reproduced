@@ -67,3 +67,5 @@ cp experiments/overnight_perceptive/plan.json logs/overnight_20261027/plan.json
 03:36 的优化器检查又发现：原调度器每次把 critic 学习率设成 actor 学习率，覆盖了独立的 `critic_lr=2e-4` 配置。低策略学习率实验因此同时减慢了 critic；原来的两组实际比例均为 1，配置期望比例应为 20 和约 6.67。现分别按配置衰减两者，新增 4 项回归检查覆盖不同学习率、相同学习率与冻结 actor 的情形。
 
 03:42，两组带 critic 的教师分别在第 15,700、14,950 步正常保存后，恢复到 `teacher_lr1e5_criticfix`、`teacher_lr3e5_criticfix`；模型、优化器和采样器状态从原 checkpoint 加载。原结果保留，`teacher_no_critic` 未中断。恢复后的比例检查保存在运行目录 `critic_lr_verified.json`。这项修正是否改善完成率，仍需后续确定性评估验证。
+
+后续 checkpoint 续训还会扩展环境步数上限，保证至少有 50,000 步剩余空间，避免模型接近原上限时提前退出。学习率衰减仍在原来的第 50,000 步结束，绝对时间截止保持不变；训练不会因此自动延长到上午截止之后。对应 4 项回归检查验证接近/达到步数上限的恢复及衰减曲线一致性。
