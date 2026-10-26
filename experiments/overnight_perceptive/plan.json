@@ -1,0 +1,38 @@
+{
+  "name": "overnight_20261027",
+  "source_commit": "74a251e843b0eeed496bddefc9d04a0e005a291a",
+  "timezone": "Asia/Shanghai",
+  "teacher_deadline": 1793052900.0,
+  "student_deadline": 1793063700.0,
+  "hard_deadline": 1793065800.0,
+  "evaluation_interval_seconds": 600,
+  "teachers": [
+    {
+      "name": "teacher_lr1e5",
+      "lr": 1e-05,
+      "seed": 0,
+      "wm_warmup_updates": 800,
+      "use_critic": true
+    },
+    {
+      "name": "teacher_lr3e5",
+      "lr": 3e-05,
+      "seed": 0,
+      "wm_warmup_updates": 500,
+      "use_critic": true
+    },
+    {
+      "name": "teacher_no_critic",
+      "lr": 3e-05,
+      "seed": 0,
+      "wm_warmup_updates": 800,
+      "use_critic": false
+    }
+  ],
+  "quality_gate": {
+    "train_completion_rate": 0.8,
+    "train_mean_norm_return": 0.65,
+    "validation_completion_rate": 0.6,
+    "validation_mean_norm_return": 0.6
+  }
+}

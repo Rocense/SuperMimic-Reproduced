@@ -72,7 +72,7 @@ export PYTHONPATH="$PWD/src"
 | [BONES-SEED](https://huggingface.co/datasets/bones-studio/seed) | 扩展动作覆盖；数据源提供 142,220 个动作，含镜像版本 | G1 包中的 120 Hz CSV |
 | 自有 G1 动作 | 追加动作或遥操作参考 | 满足下述规范的 50 Hz NPZ，或可转换的 G1 CSV |
 
-数据源规模不等于本分支已验证的规模。本分支目前的四阶段集成检查使用 `walk1_subject1` 的第 200～327 帧，共 128 帧；尚未完成完整 LAFAN1 或 BONES-SEED 的感知训练。
+数据源规模不等于本分支已验证的规模。四阶段集成检查使用 `walk1_subject1` 的第 200～327 帧，共 128 帧。2026-10-27 的服务器实验另准备了 40 个训练和 8 个 subject 5 验证行走窗口，均通过 TCRS 几何检查；训练计划和质量门槛见 [夜间实验说明](experiments/overnight_perceptive/README.md)。尚未完成完整 LAFAN1 或 BONES-SEED 的感知训练。
 
 ### LAFAN1：下载 G1 动作并转成 50 Hz NPZ
 
