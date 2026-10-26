@@ -53,11 +53,11 @@ class PolicyTrainer:
 
         self.step_fn = ImagStep(wm, lib.default_joint_pos, compile_mode=cfg.compile)
 
-    def set_lr(self, lr: float) -> None:
+    def set_lr(self, lr: float, critic_lr: float) -> None:
         for g in self.opt.param_groups:
             g["lr"] = lr
         for g in self.critic_opt.param_groups:
-            g["lr"] = lr
+            g["lr"] = critic_lr
 
     def _critic_inputs(self, ro: ImagRollout):
         H1, n, _ = ro.states.shape

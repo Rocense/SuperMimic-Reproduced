@@ -63,3 +63,7 @@ cp experiments/overnight_perceptive/plan.json logs/overnight_20261027/plan.json
 监督器增加 `--resume-teachers`，仅用于教师阶段的进程接管：按保存状态核对 worker 的用户、命令、job 路径、进程组和进程启动标识，保留现有学习器及其训练状态，恢复评估计数和最佳模型。它不用于启动重复训练，也不支持从学生阶段盲目恢复。2026-10-27 约 03:01 完成交接，三组教师 PID 保持不变。
 
 回归检查：`python -m pytest -q experiments/overnight_perceptive/test_supervise.py`，3 项通过，覆盖评估公平性、在运行的 worker 接管与完成状态读取、拒绝无关 PID。
+
+03:36 的优化器检查又发现：原调度器每次把 critic 学习率设成 actor 学习率，覆盖了独立的 `critic_lr=2e-4` 配置。低策略学习率实验因此同时减慢了 critic；原来的两组实际比例均为 1，配置期望比例应为 20 和约 6.67。现分别按配置衰减两者，新增 4 项回归检查覆盖不同学习率、相同学习率与冻结 actor 的情形。
+
+03:42，两组带 critic 的教师分别在第 15,700、14,950 步正常保存后，恢复到 `teacher_lr1e5_criticfix`、`teacher_lr3e5_criticfix`；模型、优化器和采样器状态从原 checkpoint 加载。原结果保留，`teacher_no_critic` 未中断。恢复后的比例检查保存在运行目录 `critic_lr_verified.json`。这项修正是否改善完成率，仍需后续确定性评估验证。

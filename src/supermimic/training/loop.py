@@ -268,7 +268,10 @@ class Trainer:
                         sch.lr_decay_fraction,
                     )
                     self.wm_trainer.set_lr(lr)
-                    self.policy_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
+                    self.policy_trainer.set_lr(
+                        lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr,
+                        lr * cfg.policy_trainer.critic_lr / cfg.wm_trainer.lr,
+                    )
                     t0 = time.perf_counter()
                     m_wm = self.wm_trainer.update(self.buffer)
                     torch.cuda.synchronize()
