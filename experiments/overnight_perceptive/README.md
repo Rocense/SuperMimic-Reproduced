@@ -55,3 +55,11 @@ cp experiments/overnight_perceptive/plan.json logs/overnight_20261027/plan.json
 保存使用临时文件再原子替换。每组保留初始、最新和最近两个编号 checkpoint；另保留选中的教师及最佳模型。仅移除本实验的旧编号快照和已评估临时副本，不删除源码、数据或其他项目结果。磁盘不足时停止，并保留有效快照。
 
 `completed` 表示所有计划阶段执行完毕，能力是否达标仍需阅读评估结果；`teacher_quality_not_met` 表示教师未达门槛、学生阶段未执行。`failed` 必须检查具体子进程与日志后再恢复，监督器不会盲目重复启动。
+
+## 运行中修正
+
+02:56 的检查发现，按最新 checkpoint 的修改时间选择评估对象，会偏向更新较慢的教师；更新快的无 critic 教师可能长时间得不到评估。现改为优先选择最久未评估的教师，并把评估所用的源 checkpoint 路径写入记录。
+
+监督器增加 `--resume-teachers`，仅用于教师阶段的进程接管：按保存状态核对 worker 的用户、命令、job 路径、进程组和进程启动标识，保留现有学习器及其训练状态，恢复评估计数和最佳模型。它不用于启动重复训练，也不支持从学生阶段盲目恢复。2026-10-27 约 03:01 完成交接，三组教师 PID 保持不变。
+
+回归检查：`python -m pytest -q experiments/overnight_perceptive/test_supervise.py`，3 项通过，覆盖评估公平性、在运行的 worker 接管与完成状态读取、拒绝无关 PID。

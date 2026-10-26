@@ -1,7 +1,7 @@
 """Bounded three-teacher comparison, quality gate, DAgger, BPTT and evaluation.
 
 Run from the repository root with the prepared paired dataset on local SSD.
-The process owns only the children it starts; PHP and other users' jobs are untouched.
+The process manages only this experiment's verified workers; PHP and other jobs are untouched.
 """
 import fcntl
 import json
@@ -85,6 +85,62 @@ def collect():
         print('EXIT', name, code, flush=True)
 
 
+class AdoptedWorker:
+    """Track a worker that outlived its supervisor without launching it again."""
+    def __init__(self, entry):
+        self.pid = entry['pid']
+        self.directory = Path(entry['job']['directory'])
+        self.start_time = None
+        try:
+            fields = self.process_fields()
+            if fields[0] != 'Z':
+                if not self.matches_command():
+                    raise RuntimeError(f'Worker identity mismatch for PID {self.pid}')
+                self.start_time = fields[19]
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+
+    def process_fields(self):
+        return Path(f'/proc/{self.pid}/stat').read_text().rsplit(')', 1)[1].split()
+
+    def matches_command(self):
+        proc = Path(f'/proc/{self.pid}')
+        argv = (proc / 'cmdline').read_bytes().split(b'\0')
+        return (proc.stat().st_uid == os.getuid()
+                and str(HERE / 'worker.py').encode() in argv
+                and str(self.directory / 'job.json').encode() in argv
+                and os.getpgid(self.pid) == self.pid)
+
+    def poll(self):
+        try:
+            fields = self.process_fields()
+            if (self.start_time is not None and fields[19] == self.start_time
+                    and fields[0] != 'Z' and self.matches_command()):
+                return None
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        report = self.directory / 'status.json'
+        if report.exists() and json.loads(report.read_text()).get('phase') == 'completed':
+            return 0
+        return 1
+
+
+def restore_teacher_supervision():
+    global state
+    saved = json.loads((RUN / 'status.json').read_text())
+    if saved['phase'] != 'teachers' or saved.get('selected_teacher_evaluation'):
+        raise RuntimeError('Supervisor adoption currently supports the teacher phase only')
+    adopted = {name: AdoptedWorker(entry) for name, entry in saved['jobs'].items()
+               if entry['status'] == 'running'}
+    saved.setdefault('supervisor_handoffs', []).append(dict(
+        previous_pid=saved['pid'], new_pid=os.getpid(), unix=time.time()))
+    saved['pid'] = os.getpid()
+    state = saved
+    children.update(adopted)
+    print('ADOPTED', {name: proc.pid for name, proc in children.items()}, flush=True)
+    save()
+
+
 def request_stop_teachers():
     for name in children:
         if name.startswith('teacher_'):
@@ -113,6 +169,7 @@ def score(metrics):
 
 def snapshot_candidate(names, seen):
     candidates = []
+    last_evaluated = {record['source']: index for index, record in enumerate(state['evaluations'])}
     for name in names:
         job = state['jobs'].get(name)
         if job is None:
@@ -128,35 +185,47 @@ def snapshot_candidate(names, seen):
         else:
             continue
         if key not in seen:
-            candidates.append((checkpoint.stat().st_mtime, name, checkpoint, key))
+            # Checkpoint age favors slow writers and can starve a faster teacher.
+            candidates.append((last_evaluated.get(name, -1), name, checkpoint, key))
     return min(candidates) if candidates else None
 
 
-def main():
-    if (RUN / 'status.json').exists():
-        raise RuntimeError('Existing run state: inspect it before relaunching this supervisor')
+def main(resume_teachers=False):
     if not (DATA / 'ready.json').exists():
         raise RuntimeError('TCRS dataset has not completed quality checks')
     if shutil.disk_usage(ROOT).free < 4 * 2**30:
         raise RuntimeError('At least 4 GiB free SSD space is required')
-    usage = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'], text=True)
-    if len(usage.splitlines()) < 4 or any(int(v) > 500 for v in usage.splitlines()[:4]):
-        raise RuntimeError('This experiment requires four currently idle GPUs')
-    teacher_names = []
-    for gpu, spec in enumerate(PLAN['teachers']):
-        name = spec['name']
-        teacher_names.append(name)
-        job = dict(kind='train', stage='teacher', directory=str(RUN / name),
-                   pairs=str(DATA / 'train'), deadline=PLAN['teacher_deadline'], **spec)
-        launch(name, job, gpu)
-    state['phase'] = 'teachers'
-    evaluated, processed = set(), set()
-    evaluation_name = None
-    counter = 0
-    best_teacher = best_student = None
+    if resume_teachers:
+        restore_teacher_supervision()
+        latest_per_gpu = {}
+        for name, entry in state['jobs'].items():
+            if name.startswith('teacher_'):
+                latest_per_gpu[entry['gpu']] = name
+        teacher_names = list(latest_per_gpu.values())
+    else:
+        usage = subprocess.check_output(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'], text=True)
+        if len(usage.splitlines()) < 4 or any(int(v) > 500 for v in usage.splitlines()[:4]):
+            raise RuntimeError('This experiment requires four currently idle GPUs')
+        teacher_names = []
+        for gpu, spec in enumerate(PLAN['teachers']):
+            name = spec['name']
+            teacher_names.append(name)
+            job = dict(kind='train', stage='teacher', directory=str(RUN / name),
+                       pairs=str(DATA / 'train'), deadline=PLAN['teacher_deadline'], **spec)
+            launch(name, job, gpu)
+        state['phase'] = 'teachers'
+    evaluated = {entry['job']['source_checkpoint'] for entry in state['jobs'].values()
+                 if 'source_checkpoint' in entry['job']}
+    processed = {record['evaluation'] for record in state['evaluations']}
+    pending = [name for name in state['jobs'] if name.startswith('evaluation_') and name not in processed]
+    if len(pending) > 1:
+        raise RuntimeError('Multiple unprocessed evaluations require inspection')
+    evaluation_name = pending[0] if pending else None
+    counter = max((int(name.rsplit('_', 1)[1]) for name in state['jobs'] if name.startswith('evaluation_')), default=0)
+    best_teacher, best_student = state.get('best_teacher'), state.get('best_student')
     selected_teacher = None
     last_evaluation = 0
-    extended = False
+    extended = bool(state.get('teacher_extension'))
     while not stopping:
         collect()
         if shutil.disk_usage(ROOT).free < 1.5 * 2**30:
@@ -227,7 +296,7 @@ def main():
                     continue
                 evaluated.add(key)
                 launch(evaluation_name, dict(kind='evaluate', directory=str(directory),
-                       checkpoint=str(snapshot), source=source,
+                       checkpoint=str(snapshot), source=source, source_checkpoint=str(checkpoint),
                        datasets={split: str(DATA / split) for split in ('train', 'validation')}), 3)
                 last_evaluation = time.time()
             elif all_finished and not candidate:
@@ -282,10 +351,15 @@ def main():
 
 
 if __name__ == '__main__':
+    resume_teachers = sys.argv[1:] == ['--resume-teachers']
+    if sys.argv[1:] and not resume_teachers:
+        raise SystemExit('Usage: supervise.py [--resume-teachers]')
+    if (RUN / 'status.json').exists() and not resume_teachers:
+        raise SystemExit('Existing run state: inspect it before relaunching this supervisor')
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     try:
-        main()
+        main(resume_teachers=resume_teachers)
     except BaseException as exc:
         state.update(phase='failed', error=str(exc), traceback=traceback.format_exc())
         save()
