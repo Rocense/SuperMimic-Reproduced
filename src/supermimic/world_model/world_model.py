@@ -38,21 +38,32 @@ class TerminationHead(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, cfg: WorldModelCfg, heads: AnalyticHeads, device):
+    def __init__(self, cfg: WorldModelCfg, heads: AnalyticHeads, device, terrain=None):
         super().__init__()
         self.cfg = cfg
         self.spec = StateSpec(cfg.state_spec, device)
-        self.dynamics = DynamicsMLP(hidden=cfg.hidden)
+        self.terrain = terrain
+        self.dynamics = DynamicsMLP(
+            hidden=cfg.hidden, xi_dim=33 + (terrain.cfg.obs_dim if terrain is not None else 0)
+        )
         self.term_head = TerminationHead(cfg.term_hidden, cfg.height_threshold, cfg.tilt_threshold)
         self.heads = heads  # analytic observation / reward / FK (no parameters)
         self.to(device)
 
     # ------------------------------------------------------------------ one step
 
+    def dynamics_context(self, s, xi):
+        context = self.spec.normalize_xi(xi)
+        return (
+            torch.cat([context, self.terrain.observation(s)], -1)
+            if self.terrain is not None
+            else context
+        )
+
     def step(self, s: torch.Tensor, action: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
         """s_{t+1} = integrate(s_t, f(s_t, a_t, xi))."""
         feat = self.spec.canonical(s)
-        delta = self.dynamics(feat, action, self.spec.normalize_xi(xi))
+        delta = self.dynamics(feat, action, self.dynamics_context(s, xi))
         return self.spec.integrate(s, delta)
 
     def termination_logits(self, s_next: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
@@ -66,15 +77,30 @@ class WorldModel(nn.Module):
         """One autoregressive step of Eq. 1: returns (s_next, sq_err (n,70), term_bce (n,), logits (n,))."""
         s_next = self.step(s, a, xi)
         e = self.spec.error_vector(s_next, s_true)
-        feats = self.heads.termination_features(s_next[..., 0:3], s_next[..., 3:7], ReferenceFrame(None, None, None, None, ref_root_pos, ref_root_quat))
+        feats = self.heads.termination_features(
+            s_next[..., 0:3],
+            s_next[..., 3:7],
+            ReferenceFrame(None, None, None, None, ref_root_pos, ref_root_quat),
+        )
         logits = self.term_head(feats)
         bce = F.binary_cross_entropy_with_logits(logits, done, reduction="none")
         return s_next, e * e, bce, logits
 
     def enable_compile(self, mode: str | None = "default") -> None:
-        self._loss_step_fn = torch.compile(self._loss_step, mode=None if mode == "default" else mode, dynamic=False) if mode else self._loss_step
+        self._loss_step_fn = (
+            torch.compile(self._loss_step, mode=None if mode == "default" else mode, dynamic=False)
+            if mode
+            else self._loss_step
+        )
 
-    def window_loss(self, states: torch.Tensor, a_exec: torch.Tensor, xi: torch.Tensor, done: torch.Tensor, refs: list[ReferenceFrame]):
+    def window_loss(
+        self,
+        states: torch.Tensor,
+        a_exec: torch.Tensor,
+        xi: torch.Tensor,
+        done: torch.Tensor,
+        refs: list[ReferenceFrame],
+    ):
         """k-step autoregressive loss.
 
         states: (k+1, n, 71) logged states; a_exec: (k, n, 29); xi: (n, 33);
@@ -91,7 +117,9 @@ class WorldModel(nn.Module):
         acc_num = 0.0
         step_fn = getattr(self, "_loss_step_fn", None) or self._loss_step
         for j in range(k):
-            s, sq, bce, logits = step_fn(s, a_exec[j], xi, states[j + 1], done[j], refs[j].root_pos_w, refs[j].root_quat_w)
+            s, sq, bce, logits = step_fn(
+                s, a_exec[j], xi, states[j + 1], done[j], refs[j].root_pos_w, refs[j].root_quat_w
+            )
             total_state = total_state + sq.sum(-1).mean()
             total_term = total_term + bce.mean()
             with torch.no_grad():
@@ -115,7 +143,9 @@ class WorldModel(nn.Module):
     # ------------------------------------------------------------------ diagnostics
 
     @torch.no_grad()
-    def rollout_error(self, states: torch.Tensor, a_exec: torch.Tensor, xi: torch.Tensor) -> torch.Tensor:
+    def rollout_error(
+        self, states: torch.Tensor, a_exec: torch.Tensor, xi: torch.Tensor
+    ) -> torch.Tensor:
         """Open-loop k-step normalised squared error per step (k,), averaged over the batch."""
         k = a_exec.shape[0]
         s = states[0]

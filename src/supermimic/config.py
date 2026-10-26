@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from supermimic.imagination.policy_trainer import PolicyTrainerCfg
 from supermimic.policy.nets import CriticCfg, PolicyCfg
 from supermimic.world_model.wm_trainer import WMTrainerCfg
 from supermimic.world_model.world_model import WorldModelCfg
+from supermimic.perception.terrain import TerrainCfg
 
 
 @dataclass
@@ -17,7 +19,10 @@ class DataCfg:
     clips: list[str] | None = None  # None = all npz in npz_dir
     limit: int | None = None
     manifest: Path | None = None  # csv with name,keep (filter_bones_seed.py output)
-    library: Path | None = None  # packed compact library (.pt from build_library.py); overrides npz_dir
+    library: Path | None = (
+        None  # packed compact library (.pt from build_library.py); overrides npz_dir
+    )
+    paired_dir: Path | None = None
 
 
 @dataclass
@@ -46,6 +51,7 @@ class ScheduleCfg:
     log_interval: int = 50  # iterations
     checkpoint_interval: int = 4000  # iterations
     max_hours: float | None = None
+    wm_warmup_updates: int = 0  # Fit dynamics before enabling BPTT policy updates.
 
 
 @dataclass
@@ -63,3 +69,7 @@ class TrainConfig:
     policy_trainer: PolicyTrainerCfg = field(default_factory=PolicyTrainerCfg)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
     resume: Path | None = None
+    stage: Literal["flat", "teacher", "student"] = "flat"
+    terrain: TerrainCfg = field(default_factory=TerrainCfg)
+    init_policy: Path | None = None
+    init_world_model: Path | None = None

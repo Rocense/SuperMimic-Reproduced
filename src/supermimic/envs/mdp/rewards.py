@@ -40,7 +40,14 @@ class TrackingRewardCfg:
 
     @property
     def max_step_reward(self) -> float:
-        return self.dt * (self.w_body_pos + self.w_body_ori + self.w_body_lin_vel + self.w_body_ang_vel + self.w_root_pos + self.w_root_ori)
+        return self.dt * (
+            self.w_body_pos
+            + self.w_body_ori
+            + self.w_body_lin_vel
+            + self.w_body_ang_vel
+            + self.w_root_pos
+            + self.w_root_ori
+        )
 
 
 def reanchor_reference(
@@ -62,7 +69,9 @@ def reanchor_reference(
     delta_ori = yaw_quat(quat_mul(robot_anchor_quat_w, quat_inv(ref_anchor_quat_w)))  # (N,4)
     delta_ori_b = delta_ori[..., None, :].expand(*delta_ori.shape[:-1], nb, 4)
     rel_quat = quat_mul(delta_ori_b, ref_body_quat_w)
-    rel_pos = delta_pos[..., None, :] + quat_apply(delta_ori_b, ref_body_pos_w - ref_anchor_pos_w[..., None, :])
+    rel_pos = delta_pos[..., None, :] + quat_apply(
+        delta_ori_b, ref_body_pos_w - ref_anchor_pos_w[..., None, :]
+    )
     return rel_pos, rel_quat
 
 
@@ -88,20 +97,31 @@ def tracking_reward_terms(
     joint_pos: torch.Tensor,
     soft_limits: torch.Tensor,  # (29, 2) or (N, 29, 2)
     cfg: TrackingRewardCfg,
+    body_weights: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Per-term weighted, dt-scaled rewards (N,) plus 'total'."""
     ra_pos = robot_body_pos_w[..., anchor_index, :]
     ra_quat = robot_body_quat_w[..., anchor_index, :]
     ma_pos = ref_body_pos_w[..., anchor_index, :]
     ma_quat = ref_body_quat_w[..., anchor_index, :]
-    rel_pos, rel_quat = reanchor_reference(ref_body_pos_w, ref_body_quat_w, ma_pos, ma_quat, ra_pos, ra_quat)
+    rel_pos, rel_quat = reanchor_reference(
+        ref_body_pos_w, ref_body_quat_w, ma_pos, ma_quat, ra_pos, ra_quat
+    )
 
     e_root_pos = ((ma_pos - ra_pos) ** 2).sum(-1)
     e_root_ori = _sq_quat_err(ma_quat, ra_quat)
-    e_body_pos = ((rel_pos - robot_body_pos_w) ** 2).sum(-1).mean(-1)
-    e_body_ori = _sq_quat_err(rel_quat, robot_body_quat_w).mean(-1)
-    e_body_lin = ((ref_body_lin_vel_w - robot_body_lin_vel_w) ** 2).sum(-1).mean(-1)
-    e_body_ang = ((ref_body_ang_vel_w - robot_body_ang_vel_w) ** 2).sum(-1).mean(-1)
+
+    def average(error):
+        return (
+            error.mean(-1)
+            if body_weights is None
+            else (error * body_weights).sum(-1) / body_weights.sum()
+        )
+
+    e_body_pos = average(((rel_pos - robot_body_pos_w) ** 2).sum(-1))
+    e_body_ori = average(_sq_quat_err(rel_quat, robot_body_quat_w))
+    e_body_lin = average(((ref_body_lin_vel_w - robot_body_lin_vel_w) ** 2).sum(-1))
+    e_body_ang = average(((ref_body_ang_vel_w - robot_body_ang_vel_w) ** 2).sum(-1))
 
     lo = soft_limits[..., 0]
     hi = soft_limits[..., 1]
@@ -111,12 +131,20 @@ def tracking_reward_terms(
 
     dt = cfg.dt
     terms = {
-        "motion_global_root_pos": dt * cfg.w_root_pos * torch.exp(-e_root_pos / cfg.std_root_pos**2),
-        "motion_global_root_ori": dt * cfg.w_root_ori * torch.exp(-e_root_ori / cfg.std_root_ori**2),
+        "motion_global_root_pos": dt
+        * cfg.w_root_pos
+        * torch.exp(-e_root_pos / cfg.std_root_pos**2),
+        "motion_global_root_ori": dt
+        * cfg.w_root_ori
+        * torch.exp(-e_root_ori / cfg.std_root_ori**2),
         "motion_body_pos": dt * cfg.w_body_pos * torch.exp(-e_body_pos / cfg.std_body_pos**2),
         "motion_body_ori": dt * cfg.w_body_ori * torch.exp(-e_body_ori / cfg.std_body_ori**2),
-        "motion_body_lin_vel": dt * cfg.w_body_lin_vel * torch.exp(-e_body_lin / cfg.std_body_lin_vel**2),
-        "motion_body_ang_vel": dt * cfg.w_body_ang_vel * torch.exp(-e_body_ang / cfg.std_body_ang_vel**2),
+        "motion_body_lin_vel": dt
+        * cfg.w_body_lin_vel
+        * torch.exp(-e_body_lin / cfg.std_body_lin_vel**2),
+        "motion_body_ang_vel": dt
+        * cfg.w_body_ang_vel
+        * torch.exp(-e_body_ang / cfg.std_body_ang_vel**2),
         "action_rate_l2": dt * cfg.w_action_rate * action_rate,
         "joint_limit": dt * cfg.w_joint_limit * joint_limit,
     }

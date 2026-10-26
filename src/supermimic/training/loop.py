@@ -18,7 +18,13 @@ from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BOD
 from supermimic.imagination.policy_trainer import PolicyTrainer
 from supermimic.kinematics.g1_fk import G1Kinematics
 from supermimic.policy.nets import Critic, Policy
-from supermimic.training.distributed import allreduce_mean, broadcast_params, finalize, init_distributed, world_size
+from supermimic.training.distributed import (
+    allreduce_mean,
+    broadcast_params,
+    finalize,
+    init_distributed,
+    world_size,
+)
 from supermimic.training.schedule import cosine_lr
 from supermimic.world_model.heads import AnalyticHeads
 from supermimic.world_model.wm_trainer import WorldModelTrainer
@@ -28,8 +34,19 @@ from supermimic.world_model.world_model import WorldModel
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
+        from supermimic.perception.paired import configure_stage
+
+        paired_files = configure_stage(cfg)
+        if cfg.resume is not None and (
+            cfg.init_policy is not None or cfg.init_world_model is not None
+        ):
+            raise ValueError("resume cannot be combined with initialization checkpoints")
         cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
+        cfg.policy.terrain_dim = cfg.terrain.obs_dim if cfg.stage == "student" else 0
         cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
+        cfg.policy_trainer.future_frames = cfg.env.future_frames
+        cfg.policy_trainer.history = cfg.policy.history
+        cfg.policy_trainer.obs_noise = cfg.env.obs_noise
         self.rank, local_rank, self.world = init_distributed()
         self.is_main = self.rank == 0
         if self.world > 1:
@@ -43,14 +60,24 @@ class Trainer:
         self.log_dir = Path(cfg.log_root) / cfg.run_name
         self.log_dir.mkdir(parents=True, exist_ok=True)
         if self.is_main:
-            (self.log_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2, default=str))
+            (self.log_dir / "config.json").write_text(
+                json.dumps(asdict(cfg), indent=2, default=str)
+            )
         self.writer = SummaryWriter(str(self.log_dir / "tb")) if self.is_main else None
 
-        if cfg.data.library is not None:
+        target_files = None
+        if paired_files is not None:
+            files, target_files = paired_files
+        elif cfg.data.library is not None:
             files = [cfg.data.library]
             cfg.env.compact_library = True
         else:
-            files = discover_npz(cfg.data.npz_dir, limit=cfg.data.limit, names=cfg.data.clips, manifest=cfg.data.manifest)
+            files = discover_npz(
+                cfg.data.npz_dir,
+                limit=cfg.data.limit,
+                names=cfg.data.clips,
+                manifest=cfg.data.manifest,
+            )
         if not files:
             raise FileNotFoundError(f"no clips under {cfg.data.npz_dir}")
         self.env = make_env(
@@ -58,6 +85,7 @@ class Trainer:
                 npz_files=[str(f) for f in files],
                 num_envs=cfg.env.num_envs,
                 future_frames=cfg.env.future_frames,
+                history_length=cfg.policy.history,
                 episode_length_s=cfg.env.episode_length_s,
                 action_noise_std=cfg.env.action_noise_std,
                 obs_noise=cfg.env.obs_noise,
@@ -67,6 +95,9 @@ class Trainer:
                 replay_capacity=cfg.env.replay_capacity,
                 compact_library=cfg.env.compact_library,
                 anchor_obs=cfg.env.anchor_obs,
+                terrain=cfg.terrain,
+                target_npz_files=target_files,
+                reference_is_adapted=cfg.stage != "flat",
                 seed=cfg.seed + 1000 * self.rank,
             ),
             device=self.device,
@@ -79,17 +110,51 @@ class Trainer:
         robot = env.scene["robot"]
 
         fk = G1Kinematics(load_g1_model(), device=self.device)
-        heads = AnalyticHeads(fk, TRACKED_BODIES, ANCHOR_BODY, ROOT_BODY, robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone())
-        self.wm = WorldModel(cfg.world_model, heads, self.device)
+        from supermimic.perception.terrain import TerrainField
+
+        terrain = TerrainField(cfg.terrain, self.device) if cfg.terrain.enabled else None
+        heads = AnalyticHeads(
+            fk,
+            TRACKED_BODIES,
+            ANCHOR_BODY,
+            ROOT_BODY,
+            robot.data.soft_joint_pos_limits[0].clone(),
+            robot.data.default_joint_pos[0].clone(),
+            terrain=terrain,
+            reference_is_adapted=cfg.stage != "flat",
+        )
+        self.wm = WorldModel(cfg.world_model, heads, self.device, terrain=terrain)
         self.policy = Policy(cfg.policy).to(self.device)
-        self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)
+        self.critic = Critic(
+            cfg.critic,
+            pcfg=cfg.policy,
+            feat_dim=71 + (cfg.terrain.obs_dim if terrain is not None else 0),
+        ).to(self.device)
+        if cfg.init_policy is not None:
+            ck = torch.load(cfg.init_policy, map_location=self.device, weights_only=False)
+            missing, unexpected = self.policy.load_state_dict(ck["policy"], strict=False)
+            if unexpected or any(not k.startswith("terrain_") for k in missing):
+                raise ValueError(f"incompatible policy initialization: {missing}, {unexpected}")
+        if cfg.init_world_model is not None:
+            from supermimic.perception.paired import terrain_config
+
+            ck = torch.load(cfg.init_world_model, map_location=self.device, weights_only=False)
+            if terrain_config(ck["config"]["terrain"]) != cfg.terrain:
+                raise ValueError("world-model initialization requires the same terrain")
+            self.wm.load_state_dict(ck["wm"])
         for m in (self.wm, self.policy, self.critic):
             broadcast_params(m)
-        self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
-        self.policy_trainer = PolicyTrainer(self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer)
+        self.wm_trainer = WorldModelTrainer(
+            self.wm, getattr(self.command, "tracking_library", self.lib), cfg.wm_trainer
+        )
+        self.policy_trainer = PolicyTrainer(
+            self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer
+        )
         n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
         if self.is_main:
-            print(f"[INFO] params: world model {n_params(self.wm)/1e6:.2f}M, policy {n_params(self.policy)/1e6:.2f}M, critic {n_params(self.critic)/1e6:.3f}M")
+            print(
+                f"[INFO] params: world model {n_params(self.wm) / 1e6:.2f}M, policy {n_params(self.policy) / 1e6:.2f}M, critic {n_params(self.critic) / 1e6:.3f}M"
+            )
 
         # Episode statistics of the training env (paper's "training return").
         self.ep_reward_sum = torch.zeros(env.num_envs, device=self.device)
@@ -106,6 +171,8 @@ class Trainer:
     def save(self, name: str = "ckpt_latest.pt") -> None:
         if not self.is_main:
             return
+        from supermimic.perception.control import control_contract
+
         torch.save(
             {
                 "iteration": self.iteration,
@@ -119,12 +186,20 @@ class Trainer:
                 "bin_return": self.command.bin_return,
                 "bin_memory": self.command.bin_memory,
                 "config": asdict(self.cfg),
+                "control_contract": control_contract(self.env),
             },
             self.log_dir / name,
         )
 
     def load(self, path: Path) -> None:
         ck = torch.load(path, map_location=self.device, weights_only=False)
+        from supermimic.perception.paired import terrain_config
+
+        if (
+            ck["config"].get("stage", "flat") != self.cfg.stage
+            or terrain_config(ck["config"].get("terrain", {})) != self.cfg.terrain
+        ):
+            raise ValueError("resume requires the same stage and terrain")
         self.wm.load_state_dict(ck["wm"])
         self.policy.load_state_dict(ck["policy"])
         self.critic.load_state_dict(ck["critic"])
@@ -141,7 +216,7 @@ class Trainer:
 
     @torch.no_grad()
     def act(self, obs) -> torch.Tensor:
-        return self.policy(obs["policy"], obs["goal"])
+        return self.policy(obs["policy"], obs["goal"], terrain=obs.get("terrain"))
 
     def run(self) -> None:
         cfg = self.cfg
@@ -155,6 +230,7 @@ class Trainer:
         finished_returns: list[float] = []
         finished_lens: list[float] = []
         last_log = time.time()
+        collected_steps = 0
 
         while self.iteration < sch.total_iterations:
             # ---------------- (1) collect one vectorised env step
@@ -175,13 +251,22 @@ class Trainer:
             torch.cuda.synchronize()
             timers["sim"] += time.perf_counter() - t0
             self.iteration += 1
+            collected_steps += 1
 
             # ---------------- (2)+(3) updates at the configured update-to-data ratio
-            if self.iteration >= sch.warmup_iterations:
+            if self.iteration >= sch.warmup_iterations and collected_steps >= max(
+                cfg.policy_trainer.history, cfg.wm_trainer.window + 1
+            ):
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
-                    lr = cosine_lr(self.iteration, sch.total_iterations, cfg.wm_trainer.lr, sch.lr_final_ratio, sch.lr_decay_fraction)
+                    lr = cosine_lr(
+                        self.iteration,
+                        sch.total_iterations,
+                        cfg.wm_trainer.lr,
+                        sch.lr_final_ratio,
+                        sch.lr_decay_fraction,
+                    )
                     self.wm_trainer.set_lr(lr)
                     self.policy_trainer.set_lr(lr * cfg.policy_trainer.lr / cfg.wm_trainer.lr)
                     t0 = time.perf_counter()
@@ -189,8 +274,10 @@ class Trainer:
                     torch.cuda.synchronize()
                     timers["wm"] += time.perf_counter() - t0
                     t0 = time.perf_counter()
-                    for _ in range(sch.policy_updates_per_wm_update):
-                        m_pi = self.policy_trainer.update(self.buffer)
+                    m_pi = {}
+                    if self.num_updates >= sch.wm_warmup_updates:
+                        for _ in range(sch.policy_updates_per_wm_update):
+                            m_pi = self.policy_trainer.update(self.buffer)
                     torch.cuda.synchronize()
                     timers["policy"] += time.perf_counter() - t0
                     self.num_updates += 1
@@ -225,7 +312,9 @@ class Trainer:
                 elif finished_returns:
                     tr = sum(finished_returns) / len(finished_returns)
                     self.writer.add_scalar("train/episode_norm_return", tr, it)
-                    self.writer.add_scalar("train/episode_len", sum(finished_lens) / max(len(finished_lens), 1), it)
+                    self.writer.add_scalar(
+                        "train/episode_len", sum(finished_lens) / max(len(finished_lens), 1), it
+                    )
                 else:
                     tr = float("nan")
                 with torch.no_grad():
@@ -240,15 +329,19 @@ class Trainer:
                         self.writer.add_scalar(f"time/{k}_s_per_iter", v / sch.log_interval, it)
                     self.writer.add_scalar("time/hours", elapsed / 3600, it)
                     self.writer.add_scalar("time/updates", self.num_updates, it)
-                    self.writer.add_scalar("sampler/entropy", float(self.command.metrics["sampling_entropy"][0]), it)
-                    self.writer.add_scalar("sampler/bin_return_mean", float(self.command.bin_return.mean()), it)
+                    self.writer.add_scalar(
+                        "sampler/entropy", float(self.command.metrics["sampling_entropy"][0]), it
+                    )
+                    self.writer.add_scalar(
+                        "sampler/bin_return_mean", float(self.command.bin_return.mean()), it
+                    )
                     dt_log = time.time() - last_log
                     last_log = time.time()
                     msg = (
-                        f"it {it} | {elapsed/3600:.2f} h | {sch.log_interval / dt_log:.1f} it/s | updates {self.num_updates} | "
+                        f"it {it} | {elapsed / 3600:.2f} h | {sch.log_interval / dt_log:.1f} it/s | updates {self.num_updates} | "
                         f"train_ret {tr:.3f} (n={n_finished}) | "
-                        f"wm nse1 {agg.get('wm/nse_1step', float('nan'))/max(agg_n,1):.4f} nse8 {(float(err[-1]) if err is not None else float('nan')):.4f} | "
-                        f"imag_ret {agg.get('policy/imag_return_undisc', float('nan'))/max(agg_n,1):.3f} surv {agg.get('policy/imag_survival_H', float('nan'))/max(agg_n,1):.3f} | "
+                        f"wm nse1 {agg.get('wm/nse_1step', float('nan')) / max(agg_n, 1):.4f} nse8 {(float(err[-1]) if err is not None else float('nan')):.4f} | "
+                        f"imag_ret {agg.get('policy/imag_return_undisc', float('nan')) / max(agg_n, 1):.3f} surv {agg.get('policy/imag_survival_H', float('nan')) / max(agg_n, 1):.3f} | "
                         f"t sim/wm/pi {timers['sim']:.1f}/{timers['wm']:.1f}/{timers['policy']:.1f}s"
                     )
                     print(msg, flush=True)
@@ -261,7 +354,9 @@ class Trainer:
             if sch.max_hours is not None and self.iteration % sch.log_interval == 0:
                 stop = float((time.time() - t_start) / 3600 > sch.max_hours)
                 if self.world > 1:
-                    stop = allreduce_mean(stop)  # rank 0's clock decides (all ranks agree on the mean > 0)
+                    stop = allreduce_mean(
+                        stop
+                    )  # rank 0's clock decides (all ranks agree on the mean > 0)
                 if stop > 0:
                     if self.is_main:
                         print("[INFO] max_hours reached, stopping")

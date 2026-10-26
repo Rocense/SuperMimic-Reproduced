@@ -23,6 +23,7 @@ from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
+from supermimic.perception.paired import terrain_config
 
 
 class _DictPolicy:
@@ -33,7 +34,7 @@ class _DictPolicy:
 
     @torch.no_grad()
     def __call__(self, obs):
-        return self.policy(obs["policy"], obs["goal"])
+        return self.policy(obs["policy"], obs["goal"], terrain=obs.get("terrain"))
 
 
 def main(
@@ -52,6 +53,7 @@ def main(
         npz_files=files,
         num_envs=num_envs,
         future_frames=cfg["env"]["future_frames"],
+        history_length=policy.cfg.history,
         episode_length_s=1.0e5,
         action_noise_std=0.0,
         obs_noise=False,
@@ -62,11 +64,17 @@ def main(
         seed=0,
         anchor_obs=cfg["env"].get("anchor_obs", False),
         debug_vis=ghost,
+        terrain=terrain_config(cfg.get("terrain", {})),
+        reference_is_adapted=cfg.get("stage") == "teacher",
     )
     env = RslRlVecEnvWrapper(make_env(args, device=device))
     pol = _DictPolicy(policy)
     if viewer == "auto":
-        viewer = "native" if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else "viser"
+        viewer = (
+            "native"
+            if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            else "viser"
+        )
     print(f"[INFO] {len(files)} clip(s), {num_envs} env(s), viewer={viewer}")
     try:
         if viewer == "native":

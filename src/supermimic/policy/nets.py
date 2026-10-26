@@ -27,6 +27,8 @@ class PolicyCfg:
     goal_term_scale: tuple[float, ...] = (1.0, 5.0, 1.0, 2.0, 1.0, 1.0)
     decoder_last_gain: float = 0.01
     goal_dim: int = GOAL_DIM  # 680 (+9 with anchor_obs)
+    terrain_dim: int = 0
+    terrain_latent_dim: int = 64
 
 
 @dataclass
@@ -62,7 +64,9 @@ class MotionEncoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, cfg: PolicyCfg, obs_dim: int = 930):
         super().__init__()
-        self.mlp = MLP(cfg.latent_dim + obs_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
+        self.mlp = MLP(
+            cfg.latent_dim + obs_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain
+        )
         self.register_buffer("scale", _obs_scale_vector(cfg))
 
     def forward(self, z: torch.Tensor, obs_hist: torch.Tensor) -> torch.Tensor:
@@ -76,21 +80,55 @@ class Policy(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.encoders = nn.ModuleDict({"motion": MotionEncoder(cfg)})
-        self.decoder = Decoder(cfg)
+        self.decoder = Decoder(cfg, obs_dim=93 * cfg.history)
+        if cfg.terrain_dim:
+            self.terrain_encoder = MLP(cfg.terrain_dim, (128,), cfg.terrain_latent_dim)
+            self.terrain_intent = nn.Linear(cfg.terrain_latent_dim, cfg.latent_dim)
+            self.terrain_action = MLP(cfg.terrain_latent_dim + cfg.latent_dim, (128,), ACT_DIM)
+            self.terrain_intent_gate = nn.Parameter(torch.zeros(cfg.latent_dim))
+            self.terrain_action_gate = nn.Parameter(torch.zeros(ACT_DIM))
 
-    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion") -> torch.Tensor:
-        return self.decoder(self.encoders[interface](goal), obs_hist)
+    def forward(
+        self,
+        obs_hist: torch.Tensor,
+        goal: torch.Tensor,
+        interface: str = "motion",
+        terrain: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        z = self.encoders[interface](goal)
+        if not self.cfg.terrain_dim:
+            return self.decoder(z, obs_hist)
+        if terrain is None or terrain.shape[-1] != self.cfg.terrain_dim:
+            raise ValueError(
+                f"perceptive policy requires a {self.cfg.terrain_dim}-D terrain observation"
+            )
+        zt = self.terrain_encoder(terrain)
+        z = z + self.terrain_intent_gate.tanh() * self.terrain_intent(zt)
+        return self.decoder(z, obs_hist) + self.terrain_action_gate.tanh() * self.terrain_action(
+            torch.cat([z, zt], -1)
+        )
 
 
 class Critic(nn.Module):
     """V(canonical state 71, goal 680, xi 33, root error 4) -> scalar (one per interface)."""
 
-    def __init__(self, cfg: CriticCfg, feat_dim: int = 71, goal_dim: int | None = None, xi_dim: int = 33, pcfg: PolicyCfg | None = None):
+    def __init__(
+        self,
+        cfg: CriticCfg,
+        feat_dim: int = 71,
+        goal_dim: int | None = None,
+        xi_dim: int = 33,
+        pcfg: PolicyCfg | None = None,
+    ):
         super().__init__()
         pcfg = pcfg or PolicyCfg()
         goal_dim = goal_dim or pcfg.goal_dim
         self.mlp = MLP(feat_dim + goal_dim + xi_dim + 4, cfg.hidden, 1)
         self.register_buffer("goal_scale", _goal_scale_vector(pcfg, goal_dim))
 
-    def forward(self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, e_root: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([feat, goal * self.goal_scale, xi_norm, e_root], dim=-1)).squeeze(-1)
+    def forward(
+        self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, e_root: torch.Tensor
+    ) -> torch.Tensor:
+        return self.mlp(torch.cat([feat, goal * self.goal_scale, xi_norm, e_root], dim=-1)).squeeze(
+            -1
+        )

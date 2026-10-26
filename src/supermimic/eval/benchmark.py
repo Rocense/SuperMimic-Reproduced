@@ -17,6 +17,7 @@ import torch
 
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.policy.nets import Policy, PolicyCfg
+from supermimic.perception.terrain import TerrainCfg
 
 
 @dataclass
@@ -37,12 +38,30 @@ def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, 
     policy = Policy(pcfg).to(device)
     policy.load_state_dict(ck["policy"])
     policy.eval()
-    return policy, ck["config"]
+    cfg = dict(ck["config"])
+    cfg["_control_contract"] = ck.get("control_contract")
+    return policy, cfg
 
 
 @torch.no_grad()
-def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False) -> list[ClipResult]:
+def run_benchmark(
+    policy: Policy,
+    npz_files: list[str],
+    device: str = "cuda:0",
+    num_envs: int | None = None,
+    future_frames: int = 10,
+    verbose: bool = True,
+    anchor_obs: bool = False,
+    terrain: TerrainCfg | None = None,
+    target_npz_files: list[str] | None = None,
+    reference_is_adapted: bool = False,
+    map_ablation: str = "none",
+) -> list[ClipResult]:
+    if map_ablation not in ("none", "zero", "shuffle"):
+        raise ValueError("map_ablation must be none, zero, or shuffle")
     num_envs = min(num_envs or 1024, len(npz_files))
+    if map_ablation == "shuffle" and num_envs < 2:
+        raise ValueError("shuffle requires at least two clips and parallel environments")
     args = SuperMimicEnvCfgArgs(
         npz_files=npz_files,
         num_envs=num_envs,
@@ -56,6 +75,10 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         record_transitions=False,
         seed=0,
         anchor_obs=anchor_obs,
+        terrain=terrain or TerrainCfg(),
+        target_npz_files=target_npz_files,
+        reference_is_adapted=reference_is_adapted,
+        history_length=policy.cfg.history,
     )
     env = make_env(args, device=device)
     try:
@@ -78,7 +101,12 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         results: dict[int, ClipResult] = {}
         remaining = n_clips
         while remaining > 0:
-            act = policy(obs["policy"], obs["goal"])
+            scan = obs.get("terrain")
+            if scan is not None and map_ablation == "zero":
+                scan = torch.zeros_like(scan)
+            if scan is not None and map_ablation == "shuffle":
+                scan = scan[torch.randperm(len(scan), device=scan.device)]
+            act = policy(obs["policy"], obs["goal"], terrain=scan)
             obs, rew, term, tout, _ = env.step(act)
             ret_sum += rew
             term_sum += env.reward_manager.term_rewards
@@ -97,7 +125,10 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
                             norm_return=float(ret_sum[e]) / (max_r * max(st, 1)),
                             failed=bool(term[e]),
                             fail_step=st if bool(term[e]) else -1,
-                            terms={n: float(term_sum[e, i]) / max(st, 1) for i, n in enumerate(term_names)},
+                            terms={
+                                n: float(term_sum[e, i]) / max(st, 1)
+                                for i, n in enumerate(term_names)
+                            },
                         )
                         remaining -= 1
                         if verbose and (len(results) % 50 == 0 or len(results) == n_clips):
@@ -123,11 +154,21 @@ def summarize(results: list[ClipResult]) -> dict:
     # Length-weighted return (paper Fig. 3a uses the benchmark aggregate; weighting by steps).
     tot_steps = sum(r.steps for r in results)
     w_ret = sum(r.norm_return * r.steps for r in results) / max(tot_steps, 1)
-    out = {"clips": n, "failed": failed, "mean_norm_return": mean_ret, "step_weighted_norm_return": w_ret}
+    out = {
+        "clips": n,
+        "failed": failed,
+        "mean_norm_return": mean_ret,
+        "step_weighted_norm_return": w_ret,
+    }
     if results and results[0].terms:
-        out["terms"] = {k: sum(r.terms[k] * r.steps for r in results) / max(tot_steps, 1) for k in results[0].terms}
+        out["terms"] = {
+            k: sum(r.terms[k] * r.steps for r in results) / max(tot_steps, 1)
+            for k in results[0].terms
+        }
     return out
 
 
 def save_results(results: list[ClipResult], path: str | Path) -> None:
-    Path(path).write_text(json.dumps({"summary": summarize(results), "clips": [asdict(r) for r in results]}, indent=1))
+    Path(path).write_text(
+        json.dumps({"summary": summarize(results), "clips": [asdict(r) for r in results]}, indent=1)
+    )

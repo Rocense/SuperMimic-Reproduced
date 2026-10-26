@@ -9,17 +9,30 @@ imagined rollouts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
 from supermimic.envs.mdp.rewards import TrackingRewardCfg, tracking_reward_terms
 from supermimic.kinematics.g1_fk import G1Kinematics
-from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse
+from supermimic.kinematics.rotations import (
+    projected_gravity,
+    quat_apply_inverse,
+    quat_apply,
+    heading_yaw,
+    wrap_to_pi,
+    yaw_quat,
+)
 
 OBS_DIM = 93
 # Term layout of the ``policy`` observation group (order matters: term-major history).
-OBS_TERMS = (("joint_pos", 29), ("joint_vel", 29), ("base_ang_vel", 3), ("projected_gravity", 3), ("actions", 29))
+OBS_TERMS = (
+    ("joint_pos", 29),
+    ("joint_vel", 29),
+    ("base_ang_vel", 3),
+    ("projected_gravity", 3),
+    ("actions", 29),
+)
 
 
 def split_state(s: torch.Tensor):
@@ -36,10 +49,17 @@ def analytic_observation(
     """
     _, root_quat, q, _, ang_b, qd = split_state(s)
     bias = xi[..., 1:30]
-    return torch.cat([q + bias - default_joint_pos, qd, ang_b, projected_gravity(root_quat), prev_action], dim=-1)
+    return torch.cat(
+        [q + bias - default_joint_pos, qd, ang_b, projected_gravity(root_quat), prev_action], dim=-1
+    )
 
 
-def anchor_relative_obs(robot_anchor_pos: torch.Tensor, robot_anchor_quat: torch.Tensor, ref_anchor_pos: torch.Tensor, ref_anchor_quat: torch.Tensor) -> torch.Tensor:
+def anchor_relative_obs(
+    robot_anchor_pos: torch.Tensor,
+    robot_anchor_quat: torch.Tensor,
+    ref_anchor_pos: torch.Tensor,
+    ref_anchor_quat: torch.Tensor,
+) -> torch.Tensor:
     """Reference anchor pose expressed in the robot anchor frame: [pos (3), rot6d (6)] (= mjlab's
     motion_anchor_pos_b / motion_anchor_ori_b, plan D5 alternative)."""
     from supermimic.kinematics.rotations import matrix_from_quat, quat_inv, quat_mul
@@ -89,6 +109,8 @@ class AnalyticHeads:
         soft_limits: torch.Tensor,
         default_joint_pos: torch.Tensor,
         reward_cfg: TrackingRewardCfg | None = None,
+        terrain=None,
+        reference_is_adapted: bool = False,
     ):
         self.fk = fk
         self.tracked_idx = fk.body_indices(tracked_body_names)
@@ -97,6 +119,50 @@ class AnalyticHeads:
         self.soft_limits = soft_limits
         self.default_joint_pos = default_joint_pos
         self.reward_cfg = reward_cfg or TrackingRewardCfg()
+        self.terrain = terrain
+        self.reference_is_adapted = reference_is_adapted
+        self.lower_indices = [
+            i
+            for i, name in enumerate(tracked_body_names)
+            if any(p in name for p in ("hip", "knee", "ankle"))
+        ]
+        self.foot_indices = [i for i, name in enumerate(tracked_body_names) if "ankle_roll" in name]
+        self.body_weights = torch.ones(len(tracked_body_names), device=soft_limits.device)
+        if terrain is not None and not reference_is_adapted:
+            self.body_weights[self.lower_indices] = terrain.cfg.lower_body_weight
+
+    def adapt_reference(self, ref: ReferenceFrame) -> ReferenceFrame:
+        """Geometric reward targets; the policy still receives the raw motion.
+
+        This first implementation lifts root/upper body to local support and
+        lower-body points to their local surface. It is not contact-aware TCRS
+        or an IK-generated physically feasible demonstration.
+        """
+        if self.terrain is None or self.reference_is_adapted:
+            return ref
+        root = ref.root_pos_w.clone()
+        root[..., 2] = root[..., 2] + self.terrain.height(root[..., :2])
+        if ref.body_pos_w is None:
+            return replace(ref, root_pos_w=root)
+
+        def lift(pos, root_xy):
+            offsets = self.terrain.height(root_xy)[..., None].expand(pos.shape[:-1]).clone()
+            offsets[..., self.lower_indices] = self.terrain.height(pos[..., self.lower_indices, :2])
+            return offsets
+
+        offsets = lift(ref.body_pos_w, ref.root_pos_w[..., :2])
+        pos = ref.body_pos_w.clone()
+        pos[..., 2] = pos[..., 2] + offsets
+        # Vertical velocity of the lifted path, using the same 50 Hz reference interval.
+        dt = self.reward_cfg.dt
+        root_v = ref.body_lin_vel_w[..., 0, :2]
+        dh = (
+            lift(ref.body_pos_w + dt * ref.body_lin_vel_w, ref.root_pos_w[..., :2] + dt * root_v)
+            - lift(ref.body_pos_w - dt * ref.body_lin_vel_w, ref.root_pos_w[..., :2] - dt * root_v)
+        ) / (2 * dt)
+        vel = ref.body_lin_vel_w.clone()
+        vel[..., 2] = vel[..., 2] + dh
+        return replace(ref, root_pos_w=root, body_pos_w=pos, body_lin_vel_w=vel)
 
     def robot_bodies(self, s: torch.Tensor) -> dict[str, torch.Tensor]:
         out = self.fk(s[..., :36], s[..., 36:])
@@ -110,10 +176,18 @@ class AnalyticHeads:
             "root_quat": out["quat"][..., self.root_fk_index, :],
         }
 
-    def reward(self, s_next: torch.Tensor, action: torch.Tensor, prev_action: torch.Tensor, ref: ReferenceFrame, bodies=None):
+    def reward(
+        self,
+        s_next: torch.Tensor,
+        action: torch.Tensor,
+        prev_action: torch.Tensor,
+        ref: ReferenceFrame,
+        bodies=None,
+    ):
         """Reward r_{t+1} of reaching s_next (= s_{t+1}) under target frame g_t. Returns dict with 'total'."""
         b = bodies if bodies is not None else self.robot_bodies(s_next)
-        return tracking_reward_terms(
+        ref = self.adapt_reference(ref)
+        terms = tracking_reward_terms(
             robot_body_pos_w=b["pos"],
             robot_body_quat_w=b["quat"],
             robot_body_lin_vel_w=b["lin_vel"],
@@ -128,26 +202,59 @@ class AnalyticHeads:
             joint_pos=s_next[..., 7:36],
             soft_limits=self.soft_limits,
             cfg=self.reward_cfg,
+            body_weights=self.body_weights if self.terrain is not None else None,
         )
+        if self.terrain is not None:
+            feet = b["pos"][..., self.foot_indices, :]
+            quats = b["quat"][..., self.foot_indices, :]
+            offsets = feet.new_tensor([[-0.06, 0, 0], [0, 0, 0], [0.12, 0, 0]])
+            points = feet[..., None, :] + quat_apply(
+                quats[..., None, :].expand(*feet.shape[:-1], 3, 4),
+                offsets.expand(*feet.shape[:-1], 3, 3),
+            )
+            penetration = (
+                self.terrain.height(points[..., :2])
+                + self.terrain.cfg.foot_clearance
+                - points[..., 2]
+            ).clamp_min(0)
+            penalty = (
+                -self.reward_cfg.dt
+                * self.terrain.cfg.clearance_weight
+                * (penetration / 0.1).square().mean((-1, -2))
+            )
+            terms["terrain_clearance"] = penalty
+            terms["total"] = terms["total"] + penalty
+        return terms
 
-    @staticmethod
-    def termination_features(root_pos: torch.Tensor, root_quat: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
+    def termination_features(
+        self, root_pos: torch.Tensor, root_quat: torch.Tensor, ref: ReferenceFrame
+    ) -> torch.Tensor:
         """[height error, tilt error] (N, 2) — the quantities the paper thresholds (0.25 m, 0.8)."""
-        g = torch.tensor([0.0, 0.0, -1.0], dtype=root_quat.dtype, device=root_quat.device).expand(root_quat.shape[:-1] + (3,))
-        tilt = quat_apply_inverse(ref.root_quat_w, g)[..., 2] - quat_apply_inverse(root_quat, g)[..., 2]
-        height = ref.root_pos_w[..., 2] - root_pos[..., 2]
+        g = torch.tensor([0.0, 0.0, -1.0], dtype=root_quat.dtype, device=root_quat.device).expand(
+            root_quat.shape[:-1] + (3,)
+        )
+        tilt = (
+            quat_apply_inverse(ref.root_quat_w, g)[..., 2]
+            - quat_apply_inverse(root_quat, g)[..., 2]
+        )
+        support = (
+            self.terrain.height(ref.root_pos_w[..., :2])
+            if self.terrain is not None and not self.reference_is_adapted
+            else 0
+        )
+        height = ref.root_pos_w[..., 2] + support - root_pos[..., 2]
         return torch.stack([height, tilt], dim=-1)
 
-    def terminated(self, s: torch.Tensor, ref: ReferenceFrame, height_thr: float = 0.25, tilt_thr: float = 0.8) -> torch.Tensor:
+    def terminated(
+        self, s: torch.Tensor, ref: ReferenceFrame, height_thr: float = 0.25, tilt_thr: float = 0.8
+    ) -> torch.Tensor:
         f = self.termination_features(s[..., 0:3], s[..., 3:7], ref)  # pelvis == free-joint root
         return (f[..., 0].abs() > height_thr) | (f[..., 1].abs() > tilt_thr)
 
-    @staticmethod
-    def root_error_features(s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
+    def root_error_features(self, s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
         """Critic-only privileged drift features (plan D10): root position error in the reference
         heading frame (3) and yaw error (1). (N, 4)"""
-        from supermimic.kinematics.rotations import heading_yaw, quat_apply_inverse, wrap_to_pi, yaw_quat
-
+        ref = self.adapt_reference(ref)
         dp = quat_apply_inverse(yaw_quat(ref.root_quat_w), s[..., 0:3] - ref.root_pos_w)
         dyaw = wrap_to_pi(heading_yaw(s[..., 3:7]) - heading_yaw(ref.root_quat_w))
         return torch.cat([dp, dyaw[..., None]], dim=-1)
