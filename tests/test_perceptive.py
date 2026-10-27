@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from supermimic.perception.terrain import TerrainCfg, TerrainField, add_collision_heightfield
+from supermimic.perception.terrain import TerrainCfg, TerrainField, add_collision_terrain
 from supermimic.policy.nets import Policy, PolicyCfg
 
 
@@ -47,12 +47,14 @@ def test_map_query_position_gradients():
     assert torch.isfinite(s.grad).all() and s.grad[:, 2].abs().sum() > 0
 
 
-@pytest.mark.parametrize("kind", ["flat", "boxes", "stairs", "slope"])
-def test_collision_height_matches_map_vertices(kind):
-    cfg = TerrainCfg(kind=kind, size=6, resolution=0.1, box_count=8)
+@pytest.mark.parametrize("kind,surface", [("flat", "boxes"), ("boxes", "boxes"),
+                                         ("stairs", "heightfield"), ("stairs", "boxes"),
+                                         ("slope", "boxes")])
+def test_collision_height_matches_map_vertices(kind, surface):
+    cfg = TerrainCfg(kind=kind, size=6, resolution=0.1, box_count=8, stairs_surface=surface)
     field = TerrainField(cfg)
     spec = mujoco.MjSpec()
-    add_collision_heightfield(spec, cfg)
+    add_collision_terrain(spec, cfg)
     model = spec.compile()
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)

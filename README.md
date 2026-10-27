@@ -45,7 +45,7 @@ DAgger：本体历史 + raw 参考 + 高程图 → 感知学生
 
 - **TCRS**：带迟滞的接触检测、支撑脚锁定、考虑脚尖/脚跟的采样式三次样条摆腿优化、支撑加权根部高度重建、12 个腿部关节的多点阻尼 Jacobian IK、脚/小腿穿透修复、多初值重试和连续性约束。保留原始根部朝向与上半身关节；不重排动作时间轴。
 - **参考质量过滤**：记录足端误差、穿透和关节跳变。未通过阈值的片段放入 `rejected/`，不会自动成为训练数据。NPZ 对及 manifest 使用 SHA-256 检查帧对齐和文件一致性。
-- **地形感知**：17×11 高程网格，187 个相对高度与 187 个有效性标记，共 374 维。网格随根部位置和 yaw 更新，支持高度噪声与丢点。仿真碰撞场与 Torch 查询共用高度样本及三角剖分。
+- **地形感知**：17×11 高程网格，187 个相对高度与 187 个有效性标记，共 374 维。网格随根部位置和 yaw 更新，支持高度噪声与丢点。普通高度场共用高度样本及三角剖分；新楼梯使用实体 box 和相同的解析踏面边界，保留垂直立面。
 - **感知策略**：保留原跟踪骨干，加入地形编码器、潜变量残差及动作残差，门控初始化为零。
 - **地形条件世界模型**：每个预测状态重新查询局部地图；不把 rollout 起点的裁剪图冻结到整个预测过程。
 - **DAgger**：缓存、聚合教师标签，在学生访问到的状态上继续标注；教师控制概率逐步降到零。动作标签通过实际 PD 位置目标换算。
@@ -226,6 +226,18 @@ data/tcrs_boxes/
 
 `--start-frame` 和 `--max-frames` 可用于短片段检查，两侧会使用完全相同的裁剪区间。输出目录必须为空，避免覆盖已有数据。地形可选 `flat / boxes / stairs / slope`；`height` 对 boxes 是最大高度、对 stairs 是单级高度、对 slope 是斜率（m/m）。
 
+新楼梯默认使用 `--terrain.stairs-surface boxes`。例如单级 15 cm、踏面 50 cm、4 级最高 60 cm：
+
+```bash
+python scripts/synthesize_terrain.py \
+  --npz-dir data/npz/lafan1 --output data/tcrs_stairs_15cm \
+  --clips walk1_subject1 walk1_subject2 \
+  --terrain.kind stairs --terrain.stairs-surface boxes \
+  --terrain.height 0.15 --terrain.stair-width 0.5 --terrain.stair-count 4
+```
+
+生成后还须检查轨迹确实经过台阶。当前楼梯布局沿世界 X 轴在两侧先升后降，中央留平地；仅有行走动作不保证发生上楼。更换高度或表面类型必须生成新的 TCRS 配对数据，再训练/评估。
+
 TCRS 产生运动学参考。几何检查通过后，仍需用训练好的教师验证动态可跟踪性；教师持续失败的片段应从后续 `--data.clips` 选择中排除。
 
 ## 2. 训练盲教师
@@ -278,6 +290,16 @@ python scripts/train_perceptive.py \
 `max-hours` 是示例训练预算，不表示在该时间内能够达到可靠运动效果。
 
 ## 回放、消融与未见地形
+
+先检查楼梯形状，不加载策略：
+
+```bash
+python scripts/view_terrain.py --height 0.15 --stair-width 0.5 --stair-count 4
+```
+
+这是静态几何预览，机器人仅作为尺寸参照。添加 `--output logs/stairs_15cm.png` 可以保存图片。
+
+旧 checkpoint/manifest 没有 `stairs_surface` 字段时，仍使用原来的 `heightfield`，以复现原实验。原夜间楼梯每级 2.5 cm、网格间距 10 cm，立面被三角面插值成小斜坡；这些结果不代表垂直楼梯上的训练成绩。`play.py` 可显式添加 `--stairs-surface boxes --terrain-height 0.15` 查看新几何下的行为，但这属于诊断覆盖，旧策略和旧参考并未按新地形训练，不能当作正式评测。
 
 仅运行学生和原始参考即可回放：
 

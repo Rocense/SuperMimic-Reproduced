@@ -46,9 +46,30 @@ def main(
     viewer: Literal["auto", "native", "viser"] = "auto",
     ghost: bool = True,
     sampling: Literal["start", "uniform"] = "start",
+    stairs_surface: Literal["checkpoint", "boxes", "heightfield"] = "checkpoint",
+    terrain_height: float | None = None,
 ) -> None:
     files = [str(f) for f in discover_npz(npz_dir, names=clips)]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
+    terrain = terrain_config(cfg.get("terrain", {}))
+    if stairs_surface != "checkpoint":
+        if not terrain.enabled or terrain.kind != "stairs":
+            raise ValueError("stairs_surface override requires a stair checkpoint")
+        if stairs_surface != terrain.stairs_surface:
+            print("[DIAGNOSTIC] Stair surface overridden for viewing; checkpoint and reference "
+                  "were produced on a different surface. Regenerate TCRS before training/evaluation.")
+            terrain.stairs_surface = stairs_surface
+    if terrain_height is not None:
+        if not terrain.enabled:
+            raise ValueError("terrain_height override requires a terrain checkpoint")
+        if terrain_height != terrain.height:
+            print("[DIAGNOSTIC] Terrain height overridden for viewing; regenerate paired "
+                  "references before training/evaluation on this height.")
+            terrain.height = terrain_height
+    terrain.validate()
+    if terrain.enabled and terrain.kind == "stairs":
+        print(f"[INFO] stairs surface={terrain.stairs_surface}, riser={terrain.height:g} m, "
+              f"tread={terrain.stair_width:g} m")
     args = SuperMimicEnvCfgArgs(
         npz_files=files,
         num_envs=num_envs,
@@ -64,7 +85,7 @@ def main(
         seed=0,
         anchor_obs=cfg["env"].get("anchor_obs", False),
         debug_vis=ghost,
-        terrain=terrain_config(cfg.get("terrain", {})),
+        terrain=terrain,
         reference_is_adapted=cfg.get("stage") == "teacher",
     )
     env = RslRlVecEnvWrapper(make_env(args, device=device))

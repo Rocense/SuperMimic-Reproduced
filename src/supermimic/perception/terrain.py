@@ -1,6 +1,7 @@
-"""A fixed height field, queried at every real or imagined robot pose.
+"""A fixed terrain surface, queried at every real or imagined robot pose.
 
-The same samples build MuJoCo's collision surface and the differentiable map.
+Heightfields share triangle samples between MuJoCo and the map; solid stairs
+share exact tread bounds, with vertical risers instead of interpolated ramps.
 World coordinates are origin-free; perceptive scenes use coincident origins in
 independent MuJoCo Warp worlds. Maps are immutable during a run, so replay only
 needs the state, not a stale robot-centred crop or an episode-dependent map ID.
@@ -31,6 +32,8 @@ class TerrainCfg:
     spawn_radius: float = 0.8
     stair_width: float = 0.5
     stair_count: int = 4
+    # New stairs use solid boxes; saved configurations without this field are legacy heightfields.
+    stairs_surface: Literal["boxes", "heightfield"] = "boxes"
     scan_x: tuple[float, float] = (-0.5, 1.1)
     scan_y: tuple[float, float] = (-0.5, 0.5)
     scan_shape: tuple[int, int] = (17, 11)
@@ -72,6 +75,20 @@ class TerrainCfg:
             raise ValueError("invalid terrain reward settings")
         if self.kind not in ("flat", "boxes", "stairs", "slope"):
             raise ValueError(f"unknown terrain kind: {self.kind}")
+        if self.stairs_surface not in ("boxes", "heightfield"):
+            raise ValueError(f"unknown stairs surface: {self.stairs_surface}")
+
+
+def stair_bands(cfg: TerrainCfg) -> list[tuple[float, float, float]]:
+    """Positive-X tread intervals shared by solid collision boxes and map queries."""
+    bands = []
+    for step in range(1, 2 * cfg.stair_count):
+        lo = cfg.spawn_radius + step * cfg.stair_width
+        hi = min(cfg.spawn_radius + (step + 1) * cfg.stair_width, cfg.size / 2)
+        height = cfg.height * min(step, 2 * cfg.stair_count - step)
+        if hi > lo and height > 0:
+            bands.append((lo, hi, height))
+    return bands
 
 
 def height_samples(cfg: TerrainCfg) -> np.ndarray:
@@ -87,6 +104,11 @@ def height_samples(cfg: TerrainCfg) -> np.ndarray:
             mask = (np.abs(x - cx) <= cfg.box_width / 2) & (np.abs(y - cy) <= cfg.box_width / 2)
             h[mask] = np.maximum(h[mask], rng.uniform(0.4, 1.0) * cfg.height)
     elif cfg.kind == "stairs":
+        if cfg.stairs_surface == "boxes":
+            for lo, hi, height in stair_bands(cfg):
+                mask = (np.abs(x) >= lo) & (np.abs(x) <= hi)
+                h[mask] = np.maximum(h[mask], height)
+            return h
         # A finite staircase up and back down, with a flat central spawn area.
         distance = np.maximum(np.abs(x) - cfg.spawn_radius, 0)
         steps = np.floor(distance / cfg.stair_width)
@@ -106,6 +128,7 @@ class TerrainField(nn.Module):
         super().__init__()
         cfg.validate()
         self.cfg = cfg
+        self._stair_bands = stair_bands(cfg)
         self.register_buffer("heights", torch.from_numpy(height_samples(cfg)).to(device))
         x = torch.linspace(*cfg.scan_x, cfg.scan_shape[0], device=device)
         y = torch.linspace(*cfg.scan_y, cfg.scan_shape[1], device=device)
@@ -113,11 +136,18 @@ class TerrainField(nn.Module):
         self.register_buffer("scan_offsets", torch.stack([gx.flatten(), gy.flatten()], -1))
 
     def height(self, xy: torch.Tensor) -> torch.Tensor:
-        """MuJoCo's piecewise-linear triangle samples, differentiable in xy.
+        """The collision top surface, with vertical discontinuities for box stairs.
 
-        Each cell is split along its bottom-left to top-right diagonal. Outside
+        Heightfield cells split along their bottom-left to top-right diagonal. Outside
         the finite field, the collision scene has a flat ground plane.
         """
+        if self.cfg.kind == "stairs" and self.cfg.stairs_surface == "boxes":
+            radius = xy[..., 0].abs()
+            # Keep a zero position gradient on flat treads, including an empty staircase.
+            z = xy[..., 0] * 0
+            for lo, hi, height in self._stair_bands:
+                z = torch.maximum(z, torch.where((radius >= lo) & (radius <= hi), height, 0.0))
+            return torch.where((xy.abs() <= self.cfg.size / 2).all(-1), z, torch.zeros_like(z))
         n = self.heights.shape[0]
         uv = (xy / self.cfg.size + 0.5) * (n - 1)
         uv = uv.clamp(0, n - 1 - 1e-4)
@@ -149,10 +179,28 @@ class TerrainField(nn.Module):
         return torch.cat([torch.where(valid, z, torch.zeros_like(z)), valid.to(z.dtype)], -1)
 
 
-def add_collision_heightfield(spec, cfg: TerrainCfg) -> None:
-    """SceneCfg.spec_fn callback, before MuJoCo compilation."""
+def add_collision_terrain(spec, cfg: TerrainCfg) -> None:
+    """SceneCfg callback: solid stair treads, otherwise the original heightfield."""
     import mujoco
 
+    cfg.validate()
+    if cfg.kind == "stairs" and cfg.stairs_surface == "boxes":
+        if not any(g.type == mujoco.mjtGeom.mjGEOM_PLANE for g in spec.geoms):
+            spec.worldbody.add_geom(
+                name="perceptive_base_ground", type=mujoco.mjtGeom.mjGEOM_PLANE,
+                size=[0, 0, 0.1],
+                contype=1, conaffinity=1, friction=[1.0, 0.005, 0.0001],
+            )
+        for index, (lo, hi, height) in enumerate(stair_bands(cfg)):
+            for sign, side in ((-1, "negative"), (1, "positive")):
+                spec.worldbody.add_geom(
+                    name=f"perceptive_stair_{side}_{index}", type=mujoco.mjtGeom.mjGEOM_BOX,
+                    pos=[sign * (lo + hi) / 2, 0, height / 2],
+                    size=[(hi - lo) / 2, cfg.size / 2, height / 2],
+                    contype=1, conaffinity=1, friction=[1.0, 0.005, 0.0001],
+                    rgba=[0.35, 0.42, 0.32, 1],
+                )
+        return
     heights = height_samples(cfg)
     scale = max(float(heights.max()), 1e-4)
     hf = spec.add_hfield(
@@ -171,3 +219,8 @@ def add_collision_heightfield(spec, cfg: TerrainCfg) -> None:
         friction=[1.0, 0.005, 0.0001],
         rgba=[0.35, 0.42, 0.32, 1],
     )
+
+
+def add_collision_heightfield(spec, cfg: TerrainCfg) -> None:
+    """Backward-compatible entry point; stairs follow their saved surface version."""
+    add_collision_terrain(spec, cfg)

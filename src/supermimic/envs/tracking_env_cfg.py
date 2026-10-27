@@ -338,12 +338,12 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             terrain_reward,
             terrain_height_termination,
         )
-        from supermimic.perception.terrain import add_collision_heightfield
+        from supermimic.perception.terrain import add_collision_terrain
 
         a.terrain.validate()
         cfg.scene.terrain.env_spacing = 0.0
         cfg.scene.env_spacing = 0.0
-        cfg.scene.spec_fn = partial(add_collision_heightfield, cfg=a.terrain)
+        cfg.scene.spec_fn = partial(add_collision_terrain, cfg=a.terrain)
         cfg.commands["motion"] = PerceptiveMotionCommandCfg(
             **commands["motion"].__dict__,
             terrain=a.terrain,

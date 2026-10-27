@@ -22,6 +22,7 @@ def sha256(path):
 
 def terrain_config(values):
     values = dict(values)
+    values.setdefault("stairs_surface", "heightfield" if values.get("kind") == "stairs" else "boxes")
     for key in ("scan_x", "scan_y", "scan_shape"):
         if key in values:
             values[key] = tuple(values[key])
@@ -99,7 +100,9 @@ def restore_config(values):
             raise ValueError(f"unknown saved fields: {set(values) - known}")
         for name, value in values.items():
             old = getattr(obj, name)
-            if is_dataclass(old):
+            if isinstance(old, TerrainCfg):
+                setattr(obj, name, terrain_config(value))
+            elif is_dataclass(old):
                 fill(old, value)
             else:
                 setattr(obj, name, tuple(value) if isinstance(old, tuple) else value)
