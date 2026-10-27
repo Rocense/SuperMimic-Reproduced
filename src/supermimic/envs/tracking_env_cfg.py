@@ -97,6 +97,7 @@ class SuperMimicEnvCfgArgs:
     terrain: TerrainCfg = field(default_factory=TerrainCfg)
     target_npz_files: list[str] | None = None
     reference_is_adapted: bool = False
+    pmt_tracking_evaluation: bool = False
 
 
 def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
@@ -291,6 +292,14 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
         ),
     }
 
+    if a.pmt_tracking_evaluation:
+        from supermimic.perception.filtering import pmt_tracking_termination
+
+        # Only post-teacher selection changes; SuperMimic training is unchanged.
+        terminations.pop("root_height")
+        terminations.pop("root_tilt")
+        terminations["pmt_tracking"] = TerminationTermCfg(func=pmt_tracking_termination)
+
     recorders = {}
     if a.record_transitions:
         recorders["replay"] = ReplayRecorderCfg(
@@ -356,9 +365,10 @@ def make_env_cfg(a: SuperMimicEnvCfgArgs) -> ManagerBasedRlEnvCfg:
             enable_corruption=a.obs_noise,
         )
         cfg.rewards = {"terrain_tracking": RewardTermCfg(func=terrain_reward, weight=1.0)}
-        cfg.terminations["root_height"] = TerminationTermCfg(
-            func=terrain_height_termination, params={"threshold": a.root_height_threshold}
-        )
+        if not a.pmt_tracking_evaluation:
+            cfg.terminations["root_height"] = TerminationTermCfg(
+                func=terrain_height_termination, params={"threshold": a.root_height_threshold}
+            )
         cfg.sim.nconmax = 96
         cfg.sim.njmax = 512
     return cfg

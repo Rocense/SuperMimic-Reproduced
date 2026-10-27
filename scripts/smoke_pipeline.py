@@ -51,7 +51,7 @@ def main(npz_dir: Path, output: Path = Path("logs/pipeline_smoke"), compile: boo
         ],
         check=True,
     )
-    cfg = TrainConfig(stage="teacher", run_name="teacher", log_root=output)
+    cfg = TrainConfig(stage="teacher", run_name="teacher", log_root=output, integration_test=True)
     cfg.data.paired_dir = pairs
     cfg.env.num_envs = 8
     cfg.env.replay_capacity = 64
@@ -86,11 +86,14 @@ def main(npz_dir: Path, output: Path = Path("logs/pipeline_smoke"), compile: boo
     distilled = distill(
         DistillConfig(
             teacher=teacher_path,
+            integration_test=True,
             paired_dir=pairs,
             output=output / "distilled.pt",
             steps=4,
             num_envs=8,
             buffer_steps=4,
+            rollout_steps=1,
+            learning_epochs=1,
             batch_size=16,
             decay_steps=3,
             log_interval=4,

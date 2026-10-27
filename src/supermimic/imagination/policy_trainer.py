@@ -35,6 +35,7 @@ class PolicyTrainerCfg:
     obs_noise: bool = True
     compile: str | None = "default"
     anchor_obs: bool = False  # None | "default" | "reduce-overhead" | "max-autotune-no-cudagraphs"
+    backbone_lr_scale: float = 1.0
 
 
 class PolicyTrainer:
@@ -47,7 +48,16 @@ class PolicyTrainer:
         cfg: PolicyTrainerCfg,
     ):
         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
-        self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas)
+        if cfg.backbone_lr_scale <= 0:
+            raise ValueError("backbone_lr_scale must be positive")
+        backbone, terrain_params = [], []
+        for name, parameter in policy.named_parameters():
+            (terrain_params if name.startswith("terrain_") else backbone).append(parameter)
+        groups = [{"params": backbone, "lr": cfg.lr * cfg.backbone_lr_scale,
+                   "lr_scale": cfg.backbone_lr_scale}]
+        if terrain_params:
+            groups.append({"params": terrain_params, "lr": cfg.lr, "lr_scale": 1.0})
+        self.opt = torch.optim.Adam(groups, lr=cfg.lr, betas=cfg.betas)
         self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
         from supermimic.imagination.compiled import ImagStep
 
@@ -55,7 +65,7 @@ class PolicyTrainer:
 
     def set_lr(self, lr: float, critic_lr: float) -> None:
         for g in self.opt.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * g.get("lr_scale", 1.0)
         for g in self.critic_opt.param_groups:
             g["lr"] = critic_lr
 

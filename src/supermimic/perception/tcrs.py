@@ -9,6 +9,7 @@ This produces kinematic supervision, not a proof of dynamic feasibility.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Literal
 
 import mujoco
 import numpy as np
@@ -49,8 +50,13 @@ class TCRSCfg:
     max_penetration: float = 0.025
     max_joint_jump: float = 0.45
     seed: int = 0
+    acceptance_rule: Literal["pmt_batch", "legacy"] = "pmt_batch"
+    batch_reject_ik_mm: float = 200.0
+    batch_reject_ik_bad_frames: int = 8
 
     def validate(self):
+        if self.acceptance_rule not in ("pmt_batch", "legacy") or self.batch_reject_ik_mm <= 0:
+            raise ValueError("invalid TCRS acceptance rule")
         if (
             self.knots < 2
             or self.samples < 2
@@ -325,7 +331,7 @@ class Synthesizer:
         reach = np.max(qpos[:, None, 2] - raw_points[:, :, 0, 2]) + 0.05
         cap = np.where(contacts, target[:, :, 0, 2] + reach, np.inf).min(-1)
         solved[:, 2] = np.minimum(solved[:, 2], cap)
-        errors, penetrations = [], []
+        errors, penetrations, ankle_errors = [], [], []
         for t in range(n):
             previous = solved[t - 1] if t else solved[t]
             seed = solved[t].copy()
@@ -342,6 +348,9 @@ class Synthesizer:
             self.pose(solution)
             actual = self.points()
             errors.append(float(np.linalg.norm(actual - target[t], axis=-1).max()))
+            # Official coarse filtering measures root/ankle origins, not toe/heel.
+            # Our root stays fixed to its reconstructed target during leg IK.
+            ankle_errors.append(float(np.linalg.norm(actual[:, 0] - target[t, :, 0], axis=-1).max()))
             penetration = np.maximum(self.height(actual[:, 1:, :2]) - actual[:, 1:, 2], 0).max()
             for f, knee in enumerate(self.knee_ids):
                 for point in (
@@ -372,6 +381,7 @@ class Synthesizer:
             tcrs_contacts=contacts,
             tcrs_foot_targets=target.astype(np.float32),
             tcrs_root_offset=dz.astype(np.float32),
+            tcrs_ik_position_error_m=np.asarray(ankle_errors, dtype=np.float32),
         )
         jump = float(np.abs(np.diff(solved[:, self.qadr], axis=0)).max())
         metrics = dict(
@@ -383,9 +393,18 @@ class Synthesizer:
             upper_body_joint_error=float(np.abs(solved[:, 19:] - qpos[:, 19:]).max()),
             root_orientation_error=float(np.abs(solved[:, 3:7] - qpos[:, 3:7]).max()),
         )
-        metrics["accepted"] = bool(
+        legacy_accepted = bool(
             max(errors) <= cfg.max_foot_error
             and max(penetrations) <= cfg.max_penetration
             and jump <= cfg.max_joint_jump
         )
+        if cfg.acceptance_rule == "pmt_batch":
+            from supermimic.perception.filtering import pmt_ik_acceptance
+
+            metrics.update(pmt_ik_acceptance(
+                ankle_errors, cfg.batch_reject_ik_mm, cfg.batch_reject_ik_bad_frames
+            ))
+            metrics["legacy_geometric_diagnostic_pass"] = legacy_accepted
+        else:
+            metrics.update(accepted=legacy_accepted, acceptance_rule="legacy")
         return result, metrics

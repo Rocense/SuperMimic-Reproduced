@@ -32,6 +32,10 @@ from supermimic.world_model.world_model import WorldModel
 
 
 class Trainer:
+    def should_stop(self) -> bool:
+        """Cooperative stop hook; checked by every distributed rank at log intervals."""
+        return False
+
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         from supermimic.perception.paired import configure_stage
@@ -132,6 +136,9 @@ class Trainer:
         ).to(self.device)
         if cfg.init_policy is not None:
             ck = torch.load(cfg.init_policy, map_location=self.device, weights_only=False)
+            from supermimic.perception.paired import validate_student_initialization
+
+            validate_student_initialization(cfg, ck)
             missing, unexpected = self.policy.load_state_dict(ck["policy"], strict=False)
             if unexpected or any(not k.startswith("terrain_") for k in missing):
                 raise ValueError(f"incompatible policy initialization: {missing}, {unexpected}")
@@ -172,6 +179,7 @@ class Trainer:
         if not self.is_main:
             return
         from supermimic.perception.control import control_contract
+        from supermimic.perception.paired import sha256
 
         torch.save(
             {
@@ -187,13 +195,17 @@ class Trainer:
                 "bin_memory": self.command.bin_memory,
                 "config": asdict(self.cfg),
                 "control_contract": control_contract(self.env),
+                "teacher_filter_sha256": sha256(self.cfg.data.teacher_filter)
+                    if self.cfg.data.teacher_filter is not None else None,
             },
             self.log_dir / name,
         )
 
     def load(self, path: Path) -> None:
         ck = torch.load(path, map_location=self.device, weights_only=False)
-        from supermimic.perception.paired import terrain_config
+        from supermimic.perception.paired import terrain_config, validate_student_initialization
+
+        validate_student_initialization(self.cfg, ck)
 
         if (
             ck["config"].get("stage", "flat") != self.cfg.stage
@@ -354,15 +366,17 @@ class Trainer:
             if self.iteration % sch.checkpoint_interval == 0:
                 self.save("ckpt_latest.pt")
                 self.save(f"ckpt_{self.iteration:07d}.pt")
-            if sch.max_hours is not None and self.iteration % sch.log_interval == 0:
-                stop = float((time.time() - t_start) / 3600 > sch.max_hours)
+            if self.iteration % sch.log_interval == 0:
+                stop = float(self.should_stop() or (
+                    sch.max_hours is not None and (time.time() - t_start) / 3600 > sch.max_hours
+                ))
                 if self.world > 1:
                     stop = allreduce_mean(
                         stop
                     )  # rank 0's clock decides (all ranks agree on the mean > 0)
                 if stop > 0:
                     if self.is_main:
-                        print("[INFO] max_hours reached, stopping")
+                        print("[INFO] stop requested or max_hours reached, saving and stopping")
                     break
         self.save("ckpt_latest.pt")
         if self.writer is not None:

@@ -71,6 +71,8 @@ def load_pairs(directory, names=None, limit=None):
 
 
 def configure_stage(cfg):
+    if cfg.integration_test and (cfg.env.num_envs > 16 or cfg.schedule.total_iterations > 100):
+        raise ValueError("integration-test bypass is limited to <=16 environments and <=100 steps")
     if cfg.stage == "flat":
         if cfg.terrain.enabled:
             raise ValueError("use stage teacher/student with a paired TCRS dataset")
@@ -81,13 +83,37 @@ def configure_stage(cfg):
         )
     if cfg.data.library is not None or cfg.data.manifest is not None:
         raise ValueError("paired stages use their own manifest, not a packed library or CSV filter")
-    raw, adapted, terrain, manifest = load_pairs(
-        cfg.data.paired_dir, cfg.data.clips, cfg.data.limit
-    )
+    names = cfg.data.clips
+    if cfg.stage == "student" and not cfg.integration_test:
+        from supermimic.perception.filtering import selected_reference_names
+
+        if cfg.data.teacher_filter is None:
+            raise ValueError("student training requires the per-reference teacher filter receipt")
+        kept = selected_reference_names(cfg.data.paired_dir, cfg.data.teacher_filter)
+        if cfg.data.limit is not None or (names is not None and set(names) != set(kept)):
+            raise ValueError("formal student training must use all teacher-retained references")
+        names = kept
+        if cfg.resume is None and (cfg.init_policy is None or cfg.init_world_model is None):
+            raise ValueError("student BPTT must start from the distilled student and teacher world model")
+    raw, adapted, terrain, _ = load_pairs(cfg.data.paired_dir, names, cfg.data.limit)
     if cfg.terrain.enabled and cfg.terrain != terrain:
         raise ValueError("training terrain must match the paired dataset manifest")
     cfg.terrain = terrain
     return (adapted, None) if cfg.stage == "teacher" else (raw, adapted)
+
+
+def validate_student_initialization(cfg, checkpoint):
+    if cfg.stage != "student" or cfg.integration_test:
+        return
+    expected = sha256(cfg.data.teacher_filter)
+    if checkpoint.get("teacher_filter_sha256") != expected:
+        raise ValueError("student checkpoint belongs to a different teacher-filter receipt")
+    if cfg.resume is None and checkpoint.get("stage") != "distilled_student":
+        raise ValueError("student fine-tuning must initialize from a distilled-student checkpoint")
+    if cfg.resume is None:
+        receipt = json.loads(Path(cfg.data.teacher_filter).read_text())
+        if sha256(cfg.init_world_model) != receipt["teacher_sha256"]:
+            raise ValueError("student world model must come from the teacher used for selection/distillation")
 
 
 def restore_config(values):

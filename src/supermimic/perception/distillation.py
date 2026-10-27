@@ -6,12 +6,13 @@ import copy
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
 import torch
 
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
-from supermimic.perception.control import aligned_action, control_contract
+from supermimic.perception.control import aligned_action, control_contract, pd_target_loss
 from supermimic.perception.env import goal_for_library
-from supermimic.perception.paired import load_pairs, restore_config
+from supermimic.perception.paired import load_pairs, restore_config, sha256
 from supermimic.policy.nets import Policy
 
 
@@ -20,19 +21,23 @@ class DistillConfig:
     teacher: Path
     paired_dir: Path
     output: Path
-    steps: int = 10000
+    steps: int = 240000  # Official main distillation config: 10000 iterations x 24 steps.
     num_envs: int = 256
-    buffer_steps: int = 64
+    buffer_steps: int = 24
     batch_size: int = 512
     updates_per_step: int = 1
     lr: float = 1e-4
     teacher_probability_start: float = 1.0
     teacher_probability_end: float = 0.0
-    decay_steps: int = 8000
+    decay_steps: int = 2400  # Official teacher_mix_anneal_iters=100, 24 steps/iteration.
     obs_noise: bool = True
     log_interval: int = 100
     seed: int = 0
     device: str = "cuda:0"
+    teacher_filter: Path | None = None
+    integration_test: bool = False
+    rollout_steps: int = 24
+    learning_epochs: int = 4
 
 
 class AggregationBuffer:
@@ -59,8 +64,33 @@ class AggregationBuffer:
         idx = torch.randint(self.size, (count,), device=next(iter(self.values.values())).device)
         return {k: v[idx] for k, v in self.values.items()}
 
+    def minibatches(self, batch_size):
+        order = torch.randperm(self.size, device=next(iter(self.values.values())).device)
+        for idx in order.split(batch_size):
+            yield {k: v[idx] for k, v in self.values.items()}
+
+
+class EpisodeTeacherMix:
+    """Official PMT hard switch: choose control per episode, resample only on reset."""
+
+    def __init__(self, count, probability, device):
+        self.mask = torch.rand(count, 1, device=device) < probability
+
+    def apply(self, teacher, student):
+        return torch.where(self.mask, teacher, student)
+
+    def reset(self, done, probability):
+        ids = done.nonzero().flatten()
+        self.mask[ids] = torch.rand(len(ids), 1, device=self.mask.device) < probability
+
 
 def distill(cfg: DistillConfig):
+    if cfg.integration_test and (cfg.steps > 16 or cfg.num_envs > 16):
+        raise ValueError("integration-test distillation is limited to <=16 steps/environments")
+    if cfg.teacher_filter is None and not cfg.integration_test:
+        raise ValueError("run filter_teacher_references.py before formal distillation")
+    if cfg.buffer_steps < cfg.rollout_steps or cfg.updates_per_step != 1:
+        raise ValueError("PMT distillation uses complete rollout batches and learning_epochs; updates_per_step must be 1")
     if (
         min(
             cfg.steps,
@@ -68,6 +98,8 @@ def distill(cfg: DistillConfig):
             cfg.buffer_steps,
             cfg.batch_size,
             cfg.updates_per_step,
+            cfg.rollout_steps,
+            cfg.learning_epochs,
             cfg.decay_steps,
             cfg.log_interval,
         )
@@ -83,7 +115,14 @@ def distill(cfg: DistillConfig):
     tc = restore_config(ck["config"])
     if tc.stage != "teacher" or tc.policy.terrain_dim:
         raise ValueError("DAgger requires a blind adapted-reference teacher")
-    raw, adapted, terrain, _ = load_pairs(cfg.paired_dir, tc.data.clips, tc.data.limit)
+    names = tc.data.clips
+    if not cfg.integration_test:
+        from supermimic.perception.filtering import selected_reference_names
+
+        names = selected_reference_names(cfg.paired_dir, cfg.teacher_filter, cfg.teacher)
+    raw, adapted, terrain, _ = load_pairs(
+        cfg.paired_dir, names, tc.data.limit if cfg.integration_test else None
+    )
     if tc.terrain != terrain:
         raise ValueError("teacher and dataset terrain differ")
     teacher_contract = ck.get("control_contract")
@@ -95,6 +134,11 @@ def distill(cfg: DistillConfig):
     student_cfg = copy.deepcopy(tc)
     student_cfg.stage = "student"
     student_cfg.data.paired_dir = cfg.paired_dir
+    student_cfg.data.teacher_filter = cfg.teacher_filter
+    student_cfg.data.clips = names
+    student_cfg.data.limit = None
+    student_cfg.integration_test = cfg.integration_test
+    student_cfg.policy_trainer.backbone_lr_scale = 0.3
     student_cfg.policy.terrain_dim = terrain.obs_dim
     student_cfg.resume = student_cfg.init_policy = student_cfg.init_world_model = None
     student = Policy(student_cfg.policy).to(cfg.device)
@@ -118,6 +162,7 @@ def distill(cfg: DistillConfig):
             sampling_mode="uniform",
             anchor_obs=tc.env.anchor_obs,
             record_transitions=False,
+            pmt_tracking_evaluation=not cfg.integration_test,
             seed=cfg.seed,
         ),
         device=cfg.device,
@@ -129,6 +174,8 @@ def distill(cfg: DistillConfig):
         student_contract = control_contract(env)
         obs, _ = env.reset()
         buffer = None
+        mixer = EpisodeTeacherMix(cfg.num_envs, cfg.teacher_probability_start, cfg.device)
+        last_loss = None
         for step in range(cfg.steps):
             with torch.no_grad():
                 teacher_goal = goal_for_library(
@@ -146,28 +193,33 @@ def distill(cfg: DistillConfig):
                 if buffer is None:
                     buffer = AggregationBuffer(cfg.num_envs * cfg.buffer_steps, values)
                 buffer.add(values)
-            for _ in range(cfg.updates_per_step):
-                batch = buffer.sample(cfg.batch_size)
-                pred = student(batch["history"], batch["goal"], terrain=batch["terrain"])
-                loss = torch.nn.functional.mse_loss(pred, batch["target"])
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-                optimizer.step()
-            beta = cfg.teacher_probability_start + min(step / cfg.decay_steps, 1.0) * (
+            rollout_start = step // cfg.rollout_steps * cfg.rollout_steps
+            beta = cfg.teacher_probability_start + min(rollout_start / cfg.decay_steps, 1.0) * (
                 cfg.teacher_probability_end - cfg.teacher_probability_start
             )
             with torch.no_grad():
                 student_action = student(obs["policy"], obs["goal"], terrain=obs["terrain"])
-                applied = torch.where(
-                    torch.rand(cfg.num_envs, 1, device=cfg.device) < beta, target, student_action
-                )
-                obs, _, _, _, _ = env.step(applied)
+                applied = mixer.apply(target, student_action)
+                teacher_fraction = float(mixer.mask.float().mean())
+                obs, _, terminated, timeout, _ = env.step(applied)
+                mixer.reset(terminated | timeout, beta)
+            if (step + 1) % cfg.rollout_steps == 0 or step + 1 == cfg.steps:
+                for _ in range(cfg.learning_epochs):
+                    for batch in buffer.minibatches(cfg.batch_size):
+                        pred = student(batch["history"], batch["goal"], terrain=batch["terrain"])
+                        loss = pd_target_loss(pred, batch["target"], student_contract)
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+                        optimizer.step()
+                        last_loss = float(loss.detach())
+                buffer.cursor = buffer.size = 0
             if (step + 1) % cfg.log_interval == 0 or step + 1 == cfg.steps:
                 row = {
                     "step": step + 1,
-                    "label_mse": float(loss.detach()),
+                    "pd_target_mse_rad2": last_loss,
                     "teacher_probability": beta,
+                    "teacher_control_fraction": teacher_fraction,
                     "buffer_samples": buffer.size,
                 }
                 metrics.append(row)
@@ -180,6 +232,8 @@ def distill(cfg: DistillConfig):
                 "control_contract": student_contract,
                 "stage": "distilled_student",
                 "teacher_checkpoint": str(cfg.teacher),
+                "teacher_filter_sha256": sha256(cfg.teacher_filter)
+                    if cfg.teacher_filter is not None else None,
                 "distillation": asdict(cfg),
                 "metrics": metrics,
             },

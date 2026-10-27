@@ -30,14 +30,24 @@ def main(
     out: Path | None = None,
     paired_dir: Path | None = None,
     map_ablation: str = "none",
+    library: Path | None = None,
+    pmt_tracking_evaluation: bool = False,
 ) -> None:
     if clip_list is not None:
-        clips = [l.strip() for l in open(clip_list) if l.strip()]
-    files = [str(f) for f in discover_npz(npz_dir, names=clips, manifest=manifest)]
+        with clip_list.open() as stream:
+            clips = [line.strip() for line in stream if line.strip()]
+    if library is not None:
+        if clips is not None or manifest is not None:
+            raise ValueError("packed library evaluation covers all clips; do not pass an NPZ filter")
+        files = [str(library)]
+    else:
+        files = [str(f) for f in discover_npz(npz_dir, names=clips, manifest=manifest)]
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     terrain, target_files = None, None
     is_adapted = cfg.get("stage", "flat") in ("teacher", "student")
     if is_adapted:
+        if library is not None:
+            raise ValueError("terrain evaluation requires paired references, not a raw packed library")
         paired_dir = paired_dir or cfg["data"].get("paired_dir")
         if paired_dir is None:
             raise ValueError("terrain evaluation requires a paired dataset")
@@ -55,6 +65,7 @@ def main(
         target_npz_files=target_files,
         reference_is_adapted=is_adapted,
         map_ablation=map_ablation,
+        pmt_tracking_evaluation=pmt_tracking_evaluation,
     )
     s = summarize(results)
     print(

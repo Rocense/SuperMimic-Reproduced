@@ -20,6 +20,8 @@ class Actor(torch.nn.Module):
 
 def main(ckpt: Path, out: Path):
     policy, cfg = load_policy_from_checkpoint(ckpt, "cpu")
+    if cfg.get("integration_test", False):
+        raise ValueError("integration-test policies are not deployable trained artifacts")
     if not policy.cfg.terrain_dim:
         raise ValueError("checkpoint has no terrain input")
     actor = Actor(policy).eval()

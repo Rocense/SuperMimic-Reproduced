@@ -27,3 +27,9 @@ def aligned_action(action, teacher, student):
     if (ss.abs() < 1e-8).any():
         raise ValueError("student action scale contains zero")
     return (to + ts * action - so) / ss
+
+
+def pd_target_loss(prediction, aligned_target, student_contract):
+    """MSE in physical joint-target radians, independent of normalized action scales."""
+    scale = prediction.new_tensor(student_contract["scale"])
+    return ((prediction - aligned_target) * scale).square().mean()

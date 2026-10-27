@@ -15,7 +15,7 @@ from supermimic.perception.terrain import TerrainCfg, TerrainField
 ROOT = Path('data/overnight_walk_20261027')
 TERRAIN = TerrainCfg(enabled=True, kind='stairs', size=12, resolution=0.1, height=0.025,
                      stairs_surface='heightfield')  # Preserve the historical experiment geometry.
-TCRS = TCRSCfg()
+TCRS = TCRSCfg(acceptance_rule="legacy")  # Preserve the historical acceptance criteria.
 FRAME_KEYS = ('joint_pos', 'joint_vel', 'body_pos_w', 'body_quat_w',
               'body_lin_vel_w', 'body_ang_vel_w')
 

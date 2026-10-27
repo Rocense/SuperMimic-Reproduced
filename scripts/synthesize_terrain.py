@@ -3,6 +3,7 @@
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import json
+from typing import Literal
 
 import numpy as np
 import tyro
@@ -17,6 +18,7 @@ from supermimic.perception.terrain import TerrainCfg, TerrainField
 class Config:
     npz_dir: Path
     output: Path
+    split: Literal["train", "validation", "test"] = "train"
     clips: list[str] | None = None
     max_frames: int | None = None  # Shorten both sides identically for integration tests.
     start_frame: int = 0
@@ -37,6 +39,7 @@ def generate(cfg: Config):
     synth = Synthesizer(TerrainField(cfg.terrain), cfg.tcrs)
     manifest = {
         "format": "supermimic-tcrs-v1",
+        "split": cfg.split,
         "terrain": asdict(cfg.terrain),
         "tcrs": asdict(cfg.tcrs),
         "clips": [],
@@ -57,8 +60,17 @@ def generate(cfg: Config):
         end = None if cfg.max_frames is None else cfg.start_frame + cfg.max_frames
         for key in frame_keys:
             raw[key] = raw[key][cfg.start_frame : end]
-        adapted, metrics = synth.synthesize(raw)
-        record = {"name": path.stem, "source_sha256": sha256(path), "metrics": metrics}
+        record = {"name": path.stem, "source_sha256": sha256(path),
+                  "source": path.name, "start_frame": cfg.start_frame}
+        try:
+            adapted, metrics = synth.synthesize(raw)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+            # A failed synthesis attempt is an explicit rejected candidate, not
+            # an unreported omission or a reason to discard the rest of the corpus.
+            adapted = dict(raw, rejection_error=np.array(str(exc)))
+            metrics = {"accepted": False, "frames": len(raw["joint_pos"]),
+                       "reason": "synthesis_failure", "error": str(exc)}
+        record["metrics"] = metrics
         if metrics["accepted"]:
             raw_path = cfg.output / "raw" / path.name
             adapted_path = cfg.output / "adapted" / path.name
@@ -69,6 +81,8 @@ def generate(cfg: Config):
             # Retain diagnostics for rejected references, but never train on them implicitly.
             np.savez_compressed(cfg.output / "rejected" / path.name, **adapted)
         manifest["clips"].append(record)
+        manifest["candidate_count"] = len(manifest["clips"])
+        manifest["accepted_count"] = sum(r["metrics"]["accepted"] for r in manifest["clips"])
         (cfg.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(path.stem, json.dumps(metrics), flush=True)
     if not any(r["metrics"]["accepted"] for r in manifest["clips"]):

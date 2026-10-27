@@ -6,6 +6,10 @@
 
 **训练状态（2026-10-27）：** 夜间实验已结束。最佳教师的训练/验证片段完成率为 95% / 62.5%，但平均归一化跟踪回报为 0.5535 / 0.2208，未通过质量门槛。因此本轮没有启动 DAgger、感知学生微调或正式导出；目前不能据此宣称已训练出可用感知学生。完整结果见 [验证记录](VALIDATION.md)。
 
+**流程对齐（2026-10-28）：** 按用户选择保留 SuperMimic 的 MLP、世界模型/BPTT，对齐官方 PMT 的 TCRS 粗筛、单教师流程、逐参考教师过滤和 DAgger 规则。正式蒸馏必须提供与当前教师和配对数据一致的筛选记录。旧最佳教师按新跟踪口径仅保留 6/40 条训练参考；未启动新的训练。详见 [PMT 流程与来源](experiments/pmt_protocol/README.md)。
+
+**离线适配复核：** 历史 15 cm 四个探测样本被拒绝，是依据旧的自定 5.5 cm 阈值；它们按官方批量粗筛会通过，但仍存在真实碰撞，必须再经过教师动态筛选。原始测量保留在 [适配、教师与蒸馏检查](experiments/offline_adaptation/README.md)。
+
 这是基于 [SuperMimic-Reproduced](https://github.com/Rocense/SuperMimic-Reproduced) 的研究实现。采用 [Perceptive BFM](https://arxiv.org/abs/2606.08059) 的分阶段训练路线，保留 SuperMimic 的 MLP 与可微世界模型/BPTT；TCRS 是本分支的独立工程实现。参考生成参数、网络和优化方法与原论文并不完全相同，运动能力需要收敛训练和独立评估。
 
 ## 训练与部署结构
@@ -21,7 +25,8 @@
                     │
                     ▼
 盲教师：本体历史 + adapted 参考 → 关节目标
-                    │ 在学生访问到的状态上查询教师
+                    │ 逐参考完整跟踪评估，剔除失败参考
+                    │ 在学生访问到的状态上查询冻结教师
                     ▼
 DAgger：本体历史 + raw 参考 + 高程图 → 感知学生
                     │
@@ -44,7 +49,7 @@ DAgger：本体历史 + raw 参考 + 高程图 → 感知学生
 ## 已实现的组件
 
 - **TCRS**：带迟滞的接触检测、支撑脚锁定、考虑脚尖/脚跟的采样式三次样条摆腿优化、支撑加权根部高度重建、12 个腿部关节的多点阻尼 Jacobian IK、脚/小腿穿透修复、多初值重试和连续性约束。保留原始根部朝向与上半身关节；不重排动作时间轴。
-- **参考质量过滤**：记录足端误差、穿透和关节跳变。未通过阈值的片段放入 `rejected/`，不会自动成为训练数据。NPZ 对及 manifest 使用 SHA-256 检查帧对齐和文件一致性。
+- **参考质量过滤**：默认使用官方批量 IK 粗筛（根部/脚踝误差 >200 mm 的帧数超过 8 帧则拒绝），保留碰撞和连续性诊断；教师训练后，再按锚点和末端跟踪判定逐条筛选。NPZ、manifest、教师 checkpoint 与筛选记录使用 SHA-256 绑定。
 - **地形感知**：17×11 高程网格，187 个相对高度与 187 个有效性标记，共 374 维。网格随根部位置和 yaw 更新，支持高度噪声与丢点。普通高度场共用高度样本及三角剖分；新楼梯使用实体 box 和相同的解析踏面边界，保留垂直立面。
 - **感知策略**：保留原跟踪骨干，加入地形编码器、潜变量残差及动作残差，门控初始化为零。
 - **地形条件世界模型**：每个预测状态重新查询局部地图；不把 rollout 起点的裁剪图冻结到整个预测过程。
@@ -75,6 +80,8 @@ export PYTHONPATH="$PWD/src"
 | 自有 G1 动作 | 追加动作或遥操作参考 | 满足下述规范的 50 Hz NPZ，或可转换的 G1 CSV |
 
 数据源规模不等于本分支已验证的规模。四阶段集成检查使用 `walk1_subject1` 的第 200～327 帧，共 128 帧。2026-10-27 的服务器实验另准备了 40 个训练和 8 个 subject 5 验证行走窗口，均通过 TCRS 几何检查；训练计划和质量门槛见 [夜间实验说明](experiments/overnight_perceptive/README.md)。尚未完成完整 LAFAN1 或 BONES-SEED 的感知训练。
+
+**全量接入修正：** 现已增加完整语料的校验和基础训练入口，接入服务器已有的 BONES-SEED 过滤库（129,943 段、47,475,680 帧、263.75 小时）与全部 40 个 LAFAN1 G1 长序列，不再限制为固定行走切片。基础训练保留 SuperMimic 原尺寸 MLP 与 BPTT；全量 TCRS 配对和感知学生仍未完成。数据口径、可运行命令和剩余工作见 [完整语料实验说明](experiments/full_corpus/README.md)。
 
 ### LAFAN1：下载 G1 动作并转成 50 Hz NPZ
 
@@ -197,6 +204,7 @@ TCRS 额外保存接触标记、足端目标和根部偏移。`raw/` 与 `adapte
 python scripts/synthesize_terrain.py \
   --npz-dir data/npz/lafan1_validation \
   --output data/tcrs_validation \
+  --split validation \
   --terrain.kind boxes --terrain.height 0.08 --terrain.seed 91
 ```
 
@@ -238,18 +246,17 @@ python scripts/synthesize_terrain.py \
 
 生成后还须检查轨迹确实经过台阶。当前楼梯布局沿世界 X 轴在两侧先升后降，中央留平地；仅有行走动作不保证发生上楼。更换高度或表面类型必须生成新的 TCRS 配对数据，再训练/评估。
 
-TCRS 产生运动学参考。几何检查通过后，仍需用训练好的教师验证动态可跟踪性；教师持续失败的片段应从后续 `--data.clips` 选择中排除。
+TCRS 产生运动学参考。粗筛通过后，必须运行下文的教师逐参考筛选，不能手工用整体回报替代。`--tcrs.acceptance-rule legacy` 仅用于重放历史 5.5 cm/2.5 cm/0.45 rad 判定。
 
 ## 2. 训练盲教师
 
 ```bash
 python scripts/train_perceptive.py \
   --stage teacher --run-name terrain_teacher \
-  --data.paired-dir data/tcrs_boxes \
-  --schedule.max-hours 1
+  --data.paired-dir data/tcrs_boxes
 ```
 
-教师读取 `adapted/`，actor 不使用高程图，世界模型和 critic 使用地形。训练循环先拟合世界模型，再开启 BPTT。`train_perceptive.py` 默认使用 256 个环境和 batch size 256；这些是起始配置，不是经收敛验证的最佳参数。
+教师读取 `adapted/`，actor 不使用高程图，世界模型和 critic 使用地形。主流程只训练一个带 critic 的教师。入口保留 SuperMimic 默认 MLP 尺寸、4,096 个环境、WM batch 2,048、策略 batch 4,096 和基准学习率 2e-4；没有把旧切片实验的 3e-5 当成全量最优参数，也没有套用 PPO 的学习率。
 
 可以用 `--init-policy /path/to/flat_checkpoint.pt` 加载兼容的平地策略。网络尺寸、goal 配置和关节接口必须匹配。此分支保留目标仓库原有的固定输入缩放和训练迭代口径，不能直接加载其他分支任意架构的 checkpoint。
 
@@ -259,7 +266,16 @@ python scripts/train_perceptive.py \
 python scripts/eval_benchmark.py \
   --ckpt logs/terrain_teacher/ckpt_latest.pt \
   --paired-dir data/tcrs_boxes \
-  --out logs/terrain_teacher/evaluation.json
+  --out logs/terrain_teacher/evaluation.json --pmt-tracking-evaluation
+```
+
+逐参考筛选训练数据，输出不可覆写的记录（验证/测试集保持不筛选）：
+
+```bash
+python scripts/filter_teacher_references.py \
+  --teacher logs/terrain_teacher/ckpt_latest.pt \
+  --paired-dir data/tcrs_boxes \
+  --output logs/terrain_teacher/teacher_filter.json
 ```
 
 ## 3. DAgger 蒸馏感知学生
@@ -268,26 +284,25 @@ python scripts/eval_benchmark.py \
 python scripts/distill_perceptive.py \
   --teacher logs/terrain_teacher/ckpt_latest.pt \
   --paired-dir data/tcrs_boxes \
-  --output logs/terrain_student/distilled.pt \
-  --steps 10000 --decay-steps 8000
+  --teacher-filter logs/terrain_teacher/teacher_filter.json \
+  --output logs/terrain_student/distilled.pt
 ```
 
-学生继承教师的跟踪骨干，地形残差从零门控开始。环境给学生原始参考；教师在相同状态、相同动作帧上接收适配参考。标签缓冲区聚合历史数据，执行控制逐步由教师转交给学生。
+学生继承教师骨干，地形残差从零门控开始。学生接收 raw，冻结教师接收 adapted；两者处在同一机器人状态和动作帧。标签经物理 PD 目标对齐，MSE 使用关节目标弧度。控制权在每个 episode 内保持不变，只在 reset 时按退火概率重选。默认按官方主蒸馏配置收集 24 步、优化 4 个 epoch，共 240,000 环境步，前 2,400 步对应 100 个 iteration 的控制权退火。
 
 ## 4. 世界模型/BPTT 微调学生
 
 ```bash
-python scripts/train_perceptive.py \
-  --stage student --run-name terrain_student_finetune \
-  --data.paired-dir data/tcrs_boxes \
-  --init-policy logs/terrain_student/distilled.pt \
-  --init-world-model logs/terrain_teacher/ckpt_latest.pt \
-  --schedule.max-hours 1
+python scripts/finetune_perceptive.py \
+  --student logs/terrain_student/distilled.pt \
+  --teacher logs/terrain_teacher/ckpt_latest.pt \
+  --teacher-filter logs/terrain_teacher/teacher_filter.json \
+  --paired-dir data/tcrs_boxes --run-name terrain_student_finetune
 ```
 
-学生命令保持原始参考，奖励/终止判断使用离线适配参考。教师的世界模型可以作为初始化；地形必须与配对数据一致。`--resume` 用于同阶段、同地形续训，不能与初始化参数混用。
+学生命令保持原始参考，奖励/终止判断使用离线适配参考；保留 SuperMimic 的可微奖励及世界模型训练。微调必须加载对应蒸馏学生和教师世界模型，并核对同一份筛选记录；骨干学习率为地形分支的 0.3 倍。`--resume` 用于同阶段、同地形、同筛选记录续训，不能与初始化参数混用。
 
-`max-hours` 是示例训练预算，不表示在该时间内能够达到可靠运动效果。
+训练轮数不代表收敛；教师筛选记录给出实际可跟踪的参考集合和排除原因。
 
 ## 回放、消融与未见地形
 

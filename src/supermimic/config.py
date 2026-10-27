@@ -23,6 +23,7 @@ class DataCfg:
         None  # packed compact library (.pt from build_library.py); overrides npz_dir
     )
     paired_dir: Path | None = None
+    teacher_filter: Path | None = None
 
 
 @dataclass
@@ -73,3 +74,4 @@ class TrainConfig:
     terrain: TerrainCfg = field(default_factory=TerrainCfg)
     init_policy: Path | None = None
     init_world_model: Path | None = None
+    integration_test: bool = False

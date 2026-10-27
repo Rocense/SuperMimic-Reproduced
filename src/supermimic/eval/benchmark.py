@@ -16,8 +16,8 @@ from pathlib import Path
 import torch
 
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
-from supermimic.policy.nets import Policy, PolicyCfg
 from supermimic.perception.terrain import TerrainCfg
+from supermimic.policy.nets import Policy, PolicyCfg
 
 
 @dataclass
@@ -29,6 +29,8 @@ class ClipResult:
     failed: bool
     fail_step: int  # -1 if not failed
     terms: dict | None = None  # per-term mean reward per step (dt-scaled)
+    tracking_max: dict | None = None
+    failure_reasons: list[str] | None = None
 
 
 def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, dict]:
@@ -56,10 +58,22 @@ def run_benchmark(
     target_npz_files: list[str] | None = None,
     reference_is_adapted: bool = False,
     map_ablation: str = "none",
+    pmt_tracking_evaluation: bool = False,
 ) -> list[ClipResult]:
     if map_ablation not in ("none", "zero", "shuffle"):
         raise ValueError("map_ablation must be none, zero, or shuffle")
-    num_envs = min(num_envs or 1024, len(npz_files))
+    packed = len(npz_files) == 1 and str(npz_files[0]).endswith(".pt")
+    if packed:
+        if target_npz_files is not None or reference_is_adapted:
+            raise ValueError("raw packed evaluation does not replace paired TCRS data")
+        metadata = torch.load(npz_files[0], map_location="cpu", weights_only=True, mmap=True)
+        clip_count = len(metadata["names"])
+        del metadata
+    else:
+        clip_count = len(npz_files)
+    if clip_count == 0:
+        raise ValueError("benchmark requires at least one motion clip")
+    num_envs = min(num_envs or 1024, clip_count)
     if map_ablation == "shuffle" and num_envs < 2:
         raise ValueError("shuffle requires at least two clips and parallel environments")
     args = SuperMimicEnvCfgArgs(
@@ -79,6 +93,8 @@ def run_benchmark(
         target_npz_files=target_npz_files,
         reference_is_adapted=reference_is_adapted,
         history_length=policy.cfg.history,
+        compact_library=packed,
+        pmt_tracking_evaluation=pmt_tracking_evaluation,
     )
     env = make_env(args, device=device)
     try:
@@ -98,6 +114,8 @@ def run_benchmark(
         steps = torch.zeros(num_envs, dtype=torch.long, device=device)
         term_names = list(env.reward_manager.active_terms)
         term_sum = torch.zeros(num_envs, len(term_names), device=device)
+        tracking_names = ("anchor_position_m", "anchor_gravity_z", "end_effector_position_m")
+        tracking_max = torch.zeros(num_envs, 3, device=device)
         results: dict[int, ClipResult] = {}
         remaining = n_clips
         while remaining > 0:
@@ -108,6 +126,8 @@ def run_benchmark(
                 scan = scan[torch.randperm(len(scan), device=scan.device)]
             act = policy(obs["policy"], obs["goal"], terrain=scan)
             obs, rew, term, tout, _ = env.step(act)
+            if pmt_tracking_evaluation:
+                tracking_max = torch.maximum(tracking_max, cmd.pmt_tracking_errors)
             ret_sum += rew
             term_sum += env.reward_manager.term_rewards
             steps += 1
@@ -129,6 +149,10 @@ def run_benchmark(
                                 n: float(term_sum[e, i]) / max(st, 1)
                                 for i, n in enumerate(term_names)
                             },
+                            tracking_max={k: float(v) for k, v in zip(tracking_names, tracking_max[e])}
+                                if pmt_tracking_evaluation else None,
+                            failure_reasons=[k for k, failed in zip(tracking_names, cmd.pmt_tracking_failures[e]) if failed]
+                                if pmt_tracking_evaluation else None,
                         )
                         remaining -= 1
                         if verbose and (len(results) % 50 == 0 or len(results) == n_clips):
@@ -141,6 +165,7 @@ def run_benchmark(
                 cmd.forced_frame[ids] = lib.clip_start[torch.clamp(nxt[ids], max=n_clips - 1)]
                 ret_sum[ids] = 0.0
                 term_sum[ids] = 0.0
+                tracking_max[ids] = 0.0
                 steps[ids] = 0
         return [results[i] for i in range(n_clips)]
     finally:
