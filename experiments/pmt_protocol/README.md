@@ -1,6 +1,28 @@
 # PMT 流程对齐，保留 SuperMimic MLP/BPTT
 
-用户于 2026-10-28 明确选择保留 SuperMimic 的 MLP，只对齐数据筛选、教师/学生流程和蒸馏规则。当前仍按要求暂不训练。
+用户于 2026-10-28 明确选择保留 SuperMimic 的 MLP，只对齐数据筛选、教师/学生流程和蒸馏规则，随后授权开始新一轮，并明确先完成 TCRS，不额外插入平地预训练。
+
+## 全量 TCRS 首轮
+
+入口 `experiments/pmt_protocol/prepare_full.py` 处理全部 129,943 个 BONES 保留动作，以及作为不同动作来源验证集的全部 40 个 LAFAN1 动作。每条保持完整时间轴，没有 `max_frames`、动作类型筛选或前 N 条截断。
+
+首轮明确为**每个动作一组配对**，采用 15 cm 实体台阶和可复现的平面放置/朝向变化。它覆盖完整动作库，但不等于论文每个动作约 100 个地形配对，也不是多种地形的泛化评估。该数量可以在独立新轮次中扩展，不能默默改变一个已生成数据集的定义。
+
+BONES 从原始 120 Hz CSV 重新计算 50 Hz 全精度参考；6.75 GB 的 fp16 紧凑库只作为经审计的保留名单/帧数索引，不用于恢复 TCRS 的姿态精度。输入原件复制后核对 SHA-256；每个结果独立原子保存，已完成记录与 raw/adapted 哈希用于断点续做。失败动作记录原因，不能被无声丢弃。完成全部候选后才发布正式 train/validation manifest。
+
+服务器新工作目录为 `/data2/zclin/perceptive_supermimic_20261028`，本地盘初始余量约 993 GiB。按现有输出测得的压缩率，单组全量 raw/adapted 约 150 GiB；连同输入快照和原始 CSV 缓存采用约 350 GiB 的保守预算，另保留 150 GiB 空闲。100 组按当前 NPZ 格式约需 14.7 TiB，因此本轮不生成 100 组。预处理先做全量容量检查，并在空间不足时停止派发新任务、保留已有结果。
+
+```bash
+PYTHONPATH=src:. OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python experiments/pmt_protocol/prepare_full.py \
+  --library /data/zclin/RL/Supermimic_mod/data/library/bones_seed_compact.pt \
+  --inventory /data/zclin/RL/perceptive_supermimic_full_corpus_20261027/data/full_corpus/inventory.json \
+  --archive /data/zclin/RL/Supermimic_mod/data/raw/bones_seed/g1.tar.gz \
+  --archive-sha256 52580ea8bced72ea9e2ff1e7b68f01c51c7f1099581e9a46b7c87e1dec106d8a \
+  --output data/tcrs_full_round1 --pairings-per-motion 1 --workers 32 --reserve-gib 150
+```
+
+该程序只运行 CPU 参考生成；`status.json` 区分输入快照、CSV 解压、TCRS 生成、可恢复停止和完成。教师优化只能在参考数据生成完成后开始，不能把预处理进程正常当作教师已训练或已收敛。
 
 ## 来源与边界
 
